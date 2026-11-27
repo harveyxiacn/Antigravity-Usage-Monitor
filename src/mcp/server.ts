@@ -38,7 +38,14 @@ function resolveAppHtmlPath(overridePath?: string): string {
   if (process.env.AGY_USAGE_APP_HTML && process.env.AGY_USAGE_APP_HTML.trim()) {
     return process.env.AGY_USAGE_APP_HTML.trim();
   }
-  return path.resolve(__dirname, '..', 'ui', 'index.html');
+  const candidates = [
+    path.resolve(__dirname, '..', 'ui', 'index.html'),
+    path.resolve(__dirname, 'ui', 'index.html'),
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return candidates[0];
 }
 
 function loadAppHtml(overridePath?: string): string {
@@ -104,7 +111,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
   const server = new McpServer(
     {
       name: 'antigravity-usage-monitor',
-      version: '1.2.0',
+      version: '1.3.0',
     },
     {
       capabilities: {

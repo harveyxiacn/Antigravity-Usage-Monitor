@@ -4,7 +4,7 @@
     "PostInvocation": [
       {
         "type": "command",
-        "command": "node ./dist/hooks/post-invocation.js",
+        "command": "node ./dist/bundle/post-invocation.mjs",
         "timeout": 10
       }
     ]

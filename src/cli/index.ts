@@ -85,7 +85,7 @@ function renderDashboardText(snap: UsageSnapshot): string {
     `${ANSI.bold}${ANSI.cyan}╔══════════════════════════════════════════════════════════════════════╗${ANSI.reset}`,
   );
   lines.push(
-    `${ANSI.bold}${ANSI.cyan}║${ANSI.reset}  ${ANSI.bold}Antigravity Usage Monitor v1.2${ANSI.reset}  ${ANSI.dim}[Plan: ${snap.plan.toUpperCase()} | ${new Date(snap.generatedAtMs).toLocaleTimeString()}]${ANSI.reset}`,
+    `${ANSI.bold}${ANSI.cyan}║${ANSI.reset}  ${ANSI.bold}Antigravity Usage Monitor v1.3${ANSI.reset}  ${ANSI.dim}[Plan: ${snap.plan.toUpperCase()} | ${new Date(snap.generatedAtMs).toLocaleTimeString()}]${ANSI.reset}`,
   );
   lines.push(
     `${ANSI.bold}${ANSI.cyan}╚══════════════════════════════════════════════════════════════════════╝${ANSI.reset}`,

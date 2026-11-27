@@ -29,35 +29,36 @@ function copyRecursive(src, dest) {
 }
 
 function main() {
-  const distDir = path.join(projectRoot, 'dist');
-  const uiHtml = path.join(distDir, 'ui', 'index.html');
-  if (!fs.existsSync(distDir) || !fs.existsSync(uiHtml)) {
-    console.error('请先运行 "npm run build" 构建 dist/ 与单文件 MCP App 前端。');
+  const bundleServer = path.join(projectRoot, 'dist', 'bundle', 'server.mjs');
+  const uiHtml = path.join(projectRoot, 'dist', 'ui', 'index.html');
+  if (!fs.existsSync(bundleServer) || !fs.existsSync(uiHtml)) {
+    console.error('请先运行 "npm run build" 构建单文件 bundle 与 MCP App 前端。');
     process.exit(1);
   }
 
   fs.mkdirSync(targetDir, { recursive: true });
 
-  // Copy plugin manifest, mcp_config, hooks, skills, assets
-  copyRecursive(path.join(projectRoot, 'plugin'), targetDir);
-  // Copy README and built dist
-  fs.copyFileSync(path.join(projectRoot, 'README.md'), path.join(targetDir, 'README.md'));
-  fs.copyFileSync(path.join(projectRoot, 'package.json'), path.join(targetDir, 'package.json'));
-  copyRecursive(distDir, path.join(targetDir, 'dist'));
-
-  // Symlink or copy runtime node_modules needed by MCP server (@modelcontextprotocol/sdk, zod)
-  const srcNodeModules = path.join(projectRoot, 'node_modules');
-  const destNodeModules = path.join(targetDir, 'node_modules');
-  if (fs.existsSync(srcNodeModules) && !fs.existsSync(destNodeModules)) {
+  // Remove legacy node_modules junction if present (v1.3+ is 100% standalone zero-dependency!)
+  const legacyNodeModules = path.join(targetDir, 'node_modules');
+  if (fs.existsSync(legacyNodeModules)) {
     try {
-      fs.symlinkSync(srcNodeModules, destNodeModules, 'junction');
+      fs.rmSync(legacyNodeModules, { recursive: true, force: true });
     } catch {
-      copyRecursive(srcNodeModules, destNodeModules);
+      // ignore if locked
     }
   }
 
-  console.log(`✅ 插件已安装至: ${targetDir}`);
-  console.log('Antigravity 会自动发现新插件，无需重启即可在 Customizations / 侧边栏 "+" 菜单 / 左侧导航中启用。');
+  // Copy plugin manifest, mcp_config, hooks, skills, assets
+  copyRecursive(path.join(projectRoot, 'plugin'), targetDir);
+  fs.copyFileSync(path.join(projectRoot, 'README.md'), path.join(targetDir, 'README.md'));
+  fs.copyFileSync(path.join(projectRoot, 'package.json'), path.join(targetDir, 'package.json'));
+
+  // Copy only the standalone bundles and single-file UI HTML (no node_modules needed!)
+  copyRecursive(path.join(projectRoot, 'dist', 'bundle'), path.join(targetDir, 'dist', 'bundle'));
+  copyRecursive(path.join(projectRoot, 'dist', 'ui'), path.join(targetDir, 'dist', 'ui'));
+
+  console.log(`✅ 零依赖独立插件已安装至: ${targetDir}`);
+  console.log('无需 node_modules，Antigravity 会自动发现并加载插件。');
 }
 
 main();

@@ -2,7 +2,7 @@
   "mcpServers": {
     "antigravity-usage-monitor": {
       "command": "node",
-      "args": ["${PLUGIN_ROOT}/dist/mcp/server.js"],
+      "args": ["${PLUGIN_ROOT}/dist/bundle/server.mjs"],
       "env": {
         "AGY_USAGE_DATA_DIR": "${PLUGIN_DATA}"
       }

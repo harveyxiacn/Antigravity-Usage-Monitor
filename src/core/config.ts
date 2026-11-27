@@ -302,9 +302,37 @@ export function saveState(state: PersistentState, dataDir?: string): void {
   const filePath = getStateFilePath(dataDir);
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
+  const payload = JSON.stringify(state, null, 2);
   const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tmpPath, JSON.stringify(state, null, 2), 'utf8');
-  fs.renameSync(tmpPath, filePath);
+  fs.writeFileSync(tmpPath, payload, 'utf8');
+
+  // Windows antivirus or concurrent MCP/Hook writes can briefly lock renameSync
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      fs.renameSync(tmpPath, filePath);
+      return;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException)?.code;
+      if (attempt < 2 && (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES')) {
+        const until = Date.now() + 25 * (attempt + 1);
+        while (Date.now() < until) {
+          // brief synchronous backoff
+        }
+        continue;
+      }
+      try {
+        fs.unlinkSync(tmpPath);
+      } catch {
+        // ignore cleanup error
+      }
+      // Final fallback: direct overwrite if rename was blocked on Windows
+      if (code === 'EPERM' || code === 'EBUSY') {
+        fs.writeFileSync(filePath, payload, 'utf8');
+        return;
+      }
+      throw err;
+    }
+  }
 }
 
 export function calibrationKey(poolId: PoolId, windowKind: 'short' | 'weekly'): string {

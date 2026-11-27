@@ -16,7 +16,7 @@ import type {
 
 type ActiveTab = 'overview' | 'simulate' | 'trends' | 'conversations' | 'models' | 'settings';
 
-const app = new App({ name: 'Antigravity Usage Monitor', version: '1.2.0' }, {});
+const app = new App({ name: 'Antigravity Usage Monitor', version: '1.3.0' }, {});
 
 let snapshot: UsageSnapshot | null = null;
 let selectedPoolId: PoolId = 'gemini-pro';
@@ -225,6 +225,17 @@ function renderTimelineSvg(pool: PoolSnapshot): string {
     })
     .join('');
 
+  const hoverDots = pts
+    .map((p) => {
+      const cx = xOf(p.timestampMs).toFixed(1);
+      const cy = yOf(p.remainingPct).toFixed(1);
+      const tip = p.projected
+        ? `${p.label} (预测) · 预期 ${p.remainingPct.toFixed(1)}% (区间 ${(p.conservativePct ?? p.remainingPct).toFixed(1)}% ~ ${(p.optimisticPct ?? p.remainingPct).toFixed(1)}%)`
+        : `${p.label} (历史) · 余量 ${p.remainingPct.toFixed(1)}%`;
+      return `<circle cx="${cx}" cy="${cy}" r="6" fill="transparent"><title>${escapeHtml(tip)}</title></circle>`;
+    })
+    .join('');
+
   return `
     <div class="chart-container">
       <svg class="chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
@@ -242,6 +253,7 @@ function renderTimelineSvg(pool: PoolSnapshot): string {
             ? `<circle cx="${nowX.toFixed(1)}" cy="${yOf(lastHist.remainingPct).toFixed(1)}" r="4" fill="var(--accent-info)" />`
             : ''
         }
+        ${hoverDots}
         ${xLabels}
       </svg>
       <div class="chart-legend">
@@ -1220,14 +1232,22 @@ app.onhostcontextchanged = (ctx) => {
   if (ctx.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
 };
 
+let lastRolledOverResetAt = 0;
+
 setInterval(() => {
   if (!snapshot || activeTab !== 'overview') return;
   const pool = getSelectedPool();
   if (!pool) return;
   const forecast = selectedWindow === 'short' ? pool.shortWindow : pool.weeklyWindow;
+  const remaining = forecast.nextResetAtMs - Date.now();
   const clockEl = document.getElementById('countdown-clock');
   if (clockEl) {
-    clockEl.textContent = formatDurationMs(Math.max(0, forecast.nextResetAtMs - Date.now()));
+    clockEl.textContent = formatDurationMs(Math.max(0, remaining));
+  }
+  // Automatically reload snapshot once when refresh countdown crosses 00:00:00
+  if (remaining <= 0 && forecast.nextResetAtMs !== lastRolledOverResetAt && hostConnected && !isBusy) {
+    lastRolledOverResetAt = forecast.nextResetAtMs;
+    void refreshSnapshot();
   }
 }, 1000);
 
