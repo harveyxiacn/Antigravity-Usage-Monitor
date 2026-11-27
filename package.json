@@ -1,6 +1,6 @@
 {
   "name": "antigravity-usage-monitor",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Local quota monitor, next-refresh remaining percentage forecaster, and token analytics for Google Antigravity (MCP App + Plugin + Hook + CLI).",
   "license": "MIT",
   "author": "harveyxiacn",

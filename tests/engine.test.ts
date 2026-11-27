@@ -144,7 +144,7 @@ describe('Dual-Window Quota & Forecast Engine', () => {
     expect(cal1.learnedUpdated).toBe(false);
 
     // User burns 400,000 weighted tokens over next 40 minutes and native /usage now shows 70% (-10%)
-    // Observed tokensPerPct = 400,000 / 10 = 40,000 (default ai-pro was 25,000)
+    // Observed tokensPerPct = 400,000 / 10 = 40,000 (default ai-pro is 80,000)
     const t1 = t0 + 40 * 60_000;
     const allEvents: UsageEvent[] = [
       ...eventsBeforeT0,
@@ -165,20 +165,20 @@ describe('Dual-Window Quota & Forecast Engine', () => {
     );
 
     expect(cal2.learnedUpdated).toBe(true);
-    // Expected damped update: 0.6 * 40000 + 0.4 * 25000 = 34000
-    expect(cal2.newTokensPerPct).toBe(34_000);
+    // Expected damped update: 0.6 * 40000 + 0.4 * 80000 = 56000
+    expect(cal2.newTokensPerPct).toBe(56_000);
 
-    // Subsequent event of 34,000 weighted tokens should drop remaining from 70% to 69%
+    // Subsequent event of 56,000 weighted tokens should drop remaining from 70% to 69%
     const t2 = t1 + 5 * 60_000;
     const afterEvents = [
       ...allEvents,
-      makeEvent({ timestampMs: t2, weightedTokens: 34_000 }),
+      makeEvent({ timestampMs: t2, weightedTokens: 56_000 }),
     ];
     const snapshot = buildUsageSnapshot(afterEvents, new Map(), state, 1, t2);
     const pro = snapshot.pools.find((p) => p.poolId === 'gemini-pro')!;
     expect(pro.shortWindow.calibrated).toBe(true);
     expect(pro.shortWindow.currentRemainingPct).toBeCloseTo(69.0, 1);
-    expect(pro.shortWindow.tokensPerPct).toBe(34_000);
+    expect(pro.shortWindow.tokensPerPct).toBe(56_000);
     expect(snapshot.calibrationAccuracy.totalCalibrations).toBe(2);
     expect(snapshot.calibrationAccuracy.meanAbsoluteErrorPct).not.toBeNull();
   });

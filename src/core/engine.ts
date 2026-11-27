@@ -835,6 +835,20 @@ export function applyCalibration(
     }
   } else if (!prev) {
     sampleCount = 1;
+    // First-calibration smart inference: if substantial usage occurred in the current window,
+    // infer the pool's real tokensPerPct immediately so future burn slope matches official /usage.
+    const windowStartMs = nextResetAtMs - windowDurationMs;
+    const windowWeighted = poolEvents
+      .filter((e) => e.timestampMs >= windowStartMs)
+      .reduce((acc, e) => acc + e.weightedTokens, 0);
+    const usedPct = 100 - remainingPct;
+    if (usedPct >= 15 && windowWeighted >= 100_000) {
+      const inferredTpp = windowWeighted / usedPct;
+      const minBound = defaultTpp * 0.1;
+      const maxBound = defaultTpp * 10;
+      learnedTokensPerPct = Math.round(clamp(inferredTpp, minBound, maxBound));
+      learnedUpdated = true;
+    }
   }
 
   const anchor: CalibrationAnchor = {

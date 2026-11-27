@@ -53,58 +53,58 @@ export const DEFAULT_PRICING: Record<PoolId, PoolPricingUsdPer1M> = {
 export const PLAN_PRESETS: Record<PlanId, Record<PoolId, PoolBudgets>> = {
   free: {
     'gemini-pro': {
-      shortWeightedTokens: 450_000,
-      weeklyWeightedTokens: 2_800_000,
+      shortWeightedTokens: 1_200_000,
+      weeklyWeightedTokens: 6_000_000,
     },
     'gemini-flash': {
-      shortWeightedTokens: 1_500_000,
-      weeklyWeightedTokens: 10_000_000,
+      shortWeightedTokens: 4_000_000,
+      weeklyWeightedTokens: 20_000_000,
     },
     partner: {
-      shortWeightedTokens: 300_000,
-      weeklyWeightedTokens: 1_800_000,
+      shortWeightedTokens: 200_000,
+      weeklyWeightedTokens: 1_200_000,
     },
   },
   'ai-pro': {
     'gemini-pro': {
-      shortWeightedTokens: 2_500_000,
-      weeklyWeightedTokens: 25_000_000,
+      shortWeightedTokens: 8_000_000,
+      weeklyWeightedTokens: 32_000_000,
     },
     'gemini-flash': {
-      shortWeightedTokens: 8_000_000,
+      shortWeightedTokens: 16_000_000,
       weeklyWeightedTokens: 80_000_000,
     },
     partner: {
-      shortWeightedTokens: 1_800_000,
-      weeklyWeightedTokens: 18_000_000,
+      shortWeightedTokens: 500_000,
+      weeklyWeightedTokens: 5_000_000,
     },
   },
   'ai-ultra': {
     'gemini-pro': {
-      shortWeightedTokens: 12_000_000,
-      weeklyWeightedTokens: 120_000_000,
+      shortWeightedTokens: 30_000_000,
+      weeklyWeightedTokens: 150_000_000,
     },
     'gemini-flash': {
-      shortWeightedTokens: 40_000_000,
+      shortWeightedTokens: 60_000_000,
       weeklyWeightedTokens: 400_000_000,
     },
     partner: {
-      shortWeightedTokens: 8_000_000,
-      weeklyWeightedTokens: 80_000_000,
+      shortWeightedTokens: 2_500_000,
+      weeklyWeightedTokens: 25_000_000,
     },
   },
   custom: {
     'gemini-pro': {
-      shortWeightedTokens: 2_500_000,
-      weeklyWeightedTokens: 25_000_000,
+      shortWeightedTokens: 8_000_000,
+      weeklyWeightedTokens: 32_000_000,
     },
     'gemini-flash': {
-      shortWeightedTokens: 8_000_000,
+      shortWeightedTokens: 16_000_000,
       weeklyWeightedTokens: 80_000_000,
     },
     partner: {
-      shortWeightedTokens: 1_800_000,
-      weeklyWeightedTokens: 18_000_000,
+      shortWeightedTokens: 500_000,
+      weeklyWeightedTokens: 5_000_000,
     },
   },
 };
