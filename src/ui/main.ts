@@ -9,13 +9,14 @@ import type {
   PlanId,
   PoolId,
   PoolSnapshot,
+  SimulationResult,
   UsageSnapshot,
   WindowKind,
 } from '../core/types.js';
 
-type ActiveTab = 'overview' | 'trends' | 'conversations' | 'models' | 'settings';
+type ActiveTab = 'overview' | 'simulate' | 'trends' | 'conversations' | 'models' | 'settings';
 
-const app = new App({ name: 'Antigravity Usage Monitor', version: '1.1.0' }, {});
+const app = new App({ name: 'Antigravity Usage Monitor', version: '1.2.0' }, {});
 
 let snapshot: UsageSnapshot | null = null;
 let selectedPoolId: PoolId = 'gemini-pro';
@@ -25,7 +26,12 @@ let autoRefresh = true;
 let isBusy = false;
 let statusNotice = '';
 let exportedReportText = '';
+let simulationResult: SimulationResult | null = null;
+let simTurns = 20;
+let simMinutes = 0;
+let simOffloadPct = 50;
 let hostConnected = false;
+let canSendMessage = false;
 
 function formatNumber(n: number): string {
   if (!Number.isFinite(n)) return '0';
@@ -33,6 +39,10 @@ function formatNumber(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(Math.round(n));
+}
+
+function formatUsd(n: number): string {
+  return `$${(Number.isFinite(n) ? n : 0).toFixed(2)}`;
 }
 
 function formatDurationMs(ms: number): string {
@@ -315,6 +325,7 @@ function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
     : `<span class="badge">估算模式 (${snap.plan}) · 建议对照 /usage 校准</span>`;
 
   const t = snap.totals;
+  const acc = snap.calibrationAccuracy;
 
   return `
     <div class="card">
@@ -341,9 +352,9 @@ function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
               <span class="mini-sub">刷新时刻 ${formatLocalTime(forecast.nextResetAtMs)}</span>
             </div>
             <div class="mini-box">
-              <span class="mini-label">融合燃烧速率 (有效占空比 ${Math.round(pool.burnRate.effectiveDutyCycle * 100)}%)</span>
+              <span class="mini-label">融合燃烧速率 (占空比 ${Math.round(pool.burnRate.effectiveDutyCycle * 100)}%)</span>
               <span class="mini-value">${pool.burnRate.blendedPctPerHour.toFixed(2)}%/h</span>
-              <span class="mini-sub">全速活跃 ${pool.burnRate.rawActivePctPerHour.toFixed(1)}%/h · ${formatNumber(pool.burnRate.tokensPerMinute)} tok/m</span>
+              <span class="mini-sub">全速 ${pool.burnRate.rawActivePctPerHour.toFixed(1)}%/h · ${formatNumber(pool.burnRate.tokensPerMinute)} tok/m</span>
             </div>
             <div class="mini-box">
               <span class="mini-label">全速连跑预告余量</span>
@@ -359,6 +370,7 @@ function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
 
           <div class="alert-banner ${forecast.status}">
             <span>${escapeHtml(alertText)}</span>
+            ${canSendMessage ? `<button type="button" id="btn-send-chat" class="btn" style="flex-shrink:0">发送到对话</button>` : ''}
           </div>
         </div>
       </div>
@@ -378,12 +390,12 @@ function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
       <div class="kpi-card">
         <span class="kpi-label">Prompt 缓存命中率</span>
         <span class="kpi-value">${t.allTime.cacheHitRate.toFixed(1)}%</span>
-        <span class="kpi-meta">缓存读取 ${formatNumber(t.allTime.cacheReadTokens)} · 节省 ${formatNumber(t.allTime.savedByCacheTokens)}</span>
+        <span class="kpi-meta">读取 ${formatNumber(t.allTime.cacheReadTokens)} · 省下 ${formatNumber(t.allTime.savedByCacheTokens)}</span>
       </div>
       <div class="kpi-card">
-        <span class="kpi-label">Fresh Input / Output</span>
-        <span class="kpi-value">${formatNumber(t.allTime.inputTokens)} / ${formatNumber(t.allTime.outputTokens)}</span>
-        <span class="kpi-meta">7天累计 ${formatNumber(t.weeklyWindow.totalTokens)} Tokens</span>
+        <span class="kpi-label">等效 API 净成本 / 缓存省钱</span>
+        <span class="kpi-value">${formatUsd(t.allTime.cost.estimatedApiCostUsd)}</span>
+        <span class="kpi-meta">无缓存 ${formatUsd(t.allTime.cost.withoutCacheCostUsd)} · 已省 ${formatUsd(t.allTime.cost.cacheSavingsUsd)}</span>
       </div>
     </div>
 
@@ -391,7 +403,7 @@ function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
       snap.recommendations.length > 0
         ? `
       <div class="card">
-        <div class="card-title"><span>智能省额与节奏建议</span></div>
+        <div class="card-title"><span>智能省额与上下文健康建议</span></div>
         <div style="display:flex;flex-direction:column;gap:8px;">
           ${snap.recommendations
             .map(
@@ -417,44 +429,8 @@ function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
 
     <div class="card">
       <div class="card-title">
-        <span>全配额池状态对比</span>
-        <span style="font-weight:400;text-transform:none;">5h 短窗 vs 7d 周窗</span>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>模型池</th>
-              <th class="num">5h 当前余量</th>
-              <th class="num">5h 刷新预告</th>
-              <th class="num">7d 当前余量</th>
-              <th class="num">5h 消耗 Tokens</th>
-              <th class="num">缓存命中</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${snap.pools
-              .map(
-                (p) => `
-              <tr>
-                <td><strong>${escapeHtml(p.displayName)}</strong></td>
-                <td class="num">${p.shortWindow.currentRemainingPct.toFixed(1)}%</td>
-                <td class="num"><span class="badge ${p.shortWindow.status}">${p.shortWindow.predictedRemainingPctAtReset.toFixed(1)}%</span></td>
-                <td class="num">${p.weeklyWindow.currentRemainingPct.toFixed(1)}%</td>
-                <td class="num">${formatNumber(p.shortTokens.totalTokens)}</td>
-                <td class="num">${p.shortTokens.cacheHitRate.toFixed(1)}%</td>
-              </tr>`,
-              )
-              .join('')}
-          </tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">
         <span>一键锚点校准 (对照 Antigravity 原生 /usage 或 Settings → Models)</span>
-        <span style="font-weight:400;text-transform:none;">同周期校准 2 次可自动学习 1% 额度对应 Token 系数</span>
+        <span style="font-weight:400;text-transform:none;">${acc.totalCalibrations > 0 && acc.meanAbsoluteErrorPct !== null ? `已校准 ${acc.totalCalibrations} 次 · 平均误差 MAE ${acc.meanAbsoluteErrorPct}%` : '同周期校准 2 次自动学习 1% 对应 Token 系数'}</span>
       </div>
       <form id="cal-form" class="calibration-form">
         <div class="field">
@@ -486,7 +462,116 @@ function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
         <button type="submit" class="btn primary" ${isBusy ? 'disabled' : ''}>保存校准</button>
         <button type="button" id="cal-reset-btn" class="btn" ${isBusy ? 'disabled' : ''}>重置校准</button>
       </form>
+      ${
+        acc.recentRecords.length > 0
+          ? `
+        <div class="table-wrap" style="margin-top:10px;">
+          <table>
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>池 / 窗</th>
+                <th class="num">校准前预测</th>
+                <th class="num">/usage 实测</th>
+                <th class="num">偏差</th>
+                <th class="num">1% 系数</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${acc.recentRecords
+                .slice(0, 5)
+                .map(
+                  (r) => `
+                <tr>
+                  <td>${formatLocalTime(r.timestampMs)}</td>
+                  <td><code>${escapeHtml(r.poolId)}/${r.windowKind}</code></td>
+                  <td class="num">${r.predictedPctBefore.toFixed(1)}%</td>
+                  <td class="num"><strong>${r.actualPct.toFixed(1)}%</strong></td>
+                  <td class="num">${r.absoluteErrorPct.toFixed(1)}%</td>
+                  <td class="num">${formatNumber(r.tokensPerPctAfter)}${r.learnedUpdated ? ' ✨' : ''}</td>
+                </tr>`,
+                )
+                .join('')}
+            </tbody>
+          </table>
+        </div>`
+          : ''
+      }
     </div>
+  `;
+}
+
+function renderSimulateTab(pool: PoolSnapshot, snap: UsageSnapshot): string {
+  return `
+    <div class="card">
+      <div class="card-title">
+        <span>What-If 负载模拟推演器</span>
+        <span>预测“接下来再跑 N 轮 / M 分钟，或把部分任务分流至 Flash”后的剩余额度</span>
+      </div>
+      <form id="sim-form" class="calibration-form">
+        <div class="field">
+          <label for="sim-pool">目标模型池</label>
+          <select id="sim-pool">
+            ${snap.pools
+              .map(
+                (p) =>
+                  `<option value="${p.poolId}" ${p.poolId === pool.poolId ? 'selected' : ''}>${escapeHtml(p.displayName)}</option>`,
+              )
+              .join('')}
+          </select>
+        </div>
+        <div class="field">
+          <label for="sim-turns">计划新增推理轮次</label>
+          <input id="sim-turns" type="number" min="0" max="500" value="${simTurns}" />
+        </div>
+        <div class="field">
+          <label for="sim-mins">或新增活跃编码 (分钟)</label>
+          <input id="sim-mins" type="number" min="0" max="600" value="${simMinutes}" />
+        </div>
+        <div class="field">
+          <label for="sim-offload">分流至 Gemini Flash (%)</label>
+          <input id="sim-offload" type="number" min="0" max="100" step="5" value="${simOffloadPct}" />
+        </div>
+        <button type="submit" class="btn primary" ${isBusy ? 'disabled' : ''}>运行模拟推演</button>
+      </form>
+    </div>
+
+    ${
+      simulationResult
+        ? `
+      <div class="card">
+        <div class="card-title">
+          <span>推演结果 (${escapeHtml(simulationResult.poolId)} · ${simulationResult.windowKind === 'short' ? '5h短窗' : '7d周窗'})</span>
+          <span class="badge ${simulationResult.survivesUntilReset ? 'healthy' : 'critical'}">${simulationResult.survivesUntilReset ? '纯主力池可撑到刷新' : '纯主力池将触底'}</span>
+        </div>
+        <div class="sub-metrics" style="margin-bottom:10px;">
+          <div class="mini-box">
+            <span class="mini-label">当前余量基线</span>
+            <span class="mini-value">${simulationResult.baselineRemainingPct.toFixed(1)}%</span>
+            <span class="mini-sub">计划新增 ${formatNumber(simulationResult.simulatedAddedWeightedTokens)} 加权Tok</span>
+          </div>
+          <div class="mini-box">
+            <span class="mini-label">全量主力池执行后</span>
+            <span class="mini-value" style="color:${simulationResult.survivesUntilReset ? 'var(--accent-success)' : 'var(--accent-danger)'}">${simulationResult.remainingAfterWorkloadPct.toFixed(1)}%</span>
+            <span class="mini-sub">消耗 ${simulationResult.simulatedAddedPct.toFixed(1)}%</span>
+          </div>
+          <div class="mini-box">
+            <span class="mini-label">分流 ${simulationResult.offloadToFlashPct}% 至 Flash 后</span>
+            <span class="mini-value" style="color:var(--accent-info)">${simulationResult.withOffloadRemainingPct.toFixed(1)}%</span>
+            <span class="mini-sub">为主力池省下 ${simulationResult.savedPrimaryPct.toFixed(1)}%</span>
+          </div>
+          <div class="mini-box">
+            <span class="mini-label">对 Flash 池消耗</span>
+            <span class="mini-value">${simulationResult.flashImpactPct.toFixed(1)}%</span>
+            <span class="mini-sub">低倍率高效分流</span>
+          </div>
+        </div>
+        <div class="alert-banner ${simulationResult.withOffloadRemainingPct <= snap.config.safetyBufferPct ? 'warning' : 'healthy'}">
+          <span>${escapeHtml(simulationResult.recommendation)}</span>
+        </div>
+      </div>`
+        : `<div class="card"><p style="color:var(--text-secondary)">点击上方「运行模拟推演」，即可基于你的历史单轮平均 Token 消耗模拟未来负载与 Flash 分流收益。</p></div>`
+    }
   `;
 }
 
@@ -502,7 +587,7 @@ function renderTrendsTab(snap: UsageSnapshot): string {
 
     <div class="card">
       <div class="card-title">
-        <span>最近 7 天每日消耗趋势</span>
+        <span>最近 7 天每日消耗与等效费用趋势</span>
         <div style="display:flex;gap:6px;">
           <button type="button" id="btn-export-md" class="btn" ${isBusy ? 'disabled' : ''}>生成 Markdown 报告</button>
           <button type="button" id="btn-export-csv" class="btn" ${isBusy ? 'disabled' : ''}>生成 CSV 表格</button>
@@ -516,8 +601,8 @@ function renderTrendsTab(snap: UsageSnapshot): string {
               <th class="num">总 Tokens</th>
               <th class="num">加权 Tokens</th>
               <th class="num">缓存命中率</th>
-              <th class="num">推理轮次</th>
-              <th class="num">工具调用</th>
+              <th class="num">等效 API 费</th>
+              <th class="num">轮次</th>
             </tr>
           </thead>
           <tbody>
@@ -531,8 +616,8 @@ function renderTrendsTab(snap: UsageSnapshot): string {
                 <td class="num"><strong>${formatNumber(d.totalTokens)}</strong></td>
                 <td class="num">${formatNumber(d.weightedTokens)}</td>
                 <td class="num">${d.cacheHitRate.toFixed(1)}%</td>
+                <td class="num">${formatUsd(d.estimatedApiCostUsd)}</td>
                 <td class="num">${d.turns}</td>
-                <td class="num">${d.toolCalls}</td>
               </tr>`,
               )
               .join('')}
@@ -557,49 +642,88 @@ function renderTrendsTab(snap: UsageSnapshot): string {
 }
 
 function renderConversationsTab(snap: UsageSnapshot): string {
-  if (snap.conversations.length === 0) {
-    return '<div class="card"><p style="color:var(--text-secondary)">尚未扫描到包含 Token 记录的 Antigravity 会话。</p></div>';
-  }
   return `
+    ${
+      snap.projects.length > 0
+        ? `
+      <div class="card">
+        <div class="card-title">
+          <span>按工作区 / 项目聚合消耗 (${snap.projects.length} 个项目)</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>项目名称</th>
+                <th class="num">会话数</th>
+                <th>主力模型</th>
+                <th class="num">总 Tokens</th>
+                <th class="num">缓存命中</th>
+                <th class="num">等效费用</th>
+                <th class="num">占比</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${snap.projects
+                .map(
+                  (p) => `
+                <tr>
+                  <td><strong>${escapeHtml(p.projectName)}</strong></td>
+                  <td class="num">${p.conversationCount}</td>
+                  <td><code>${escapeHtml(p.topModel)}</code></td>
+                  <td class="num"><strong>${formatNumber(p.tokens.totalTokens)}</strong></td>
+                  <td class="num">${p.tokens.cacheHitRate.toFixed(1)}%</td>
+                  <td class="num">${formatUsd(p.tokens.cost.estimatedApiCostUsd)}</td>
+                  <td class="num">${p.shareOfAllTimePct.toFixed(1)}%</td>
+                </tr>`,
+                )
+                .join('')}
+            </tbody>
+          </table>
+        </div>
+      </div>`
+        : ''
+    }
+
     <div class="card">
       <div class="card-title">
-        <span>会话 Token 消耗排行 (共 ${snap.conversations.length} 个会话)</span>
+        <span>会话 Token 消耗排行与上下文膨胀诊断 (共 ${snap.conversations.length} 个会话)</span>
         <span>来源文件 ${snap.scannedFilesCount} 个</span>
       </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>会话标题</th>
-              <th>端</th>
-              <th class="num">总 Tokens</th>
-              <th class="num">Fresh In</th>
-              <th class="num">Cache Read</th>
-              <th class="num">Output</th>
-              <th class="num">命中率</th>
-              <th class="num">占比</th>
-            </tr>
-          </thead>
-          <tbody>
-            ${snap.conversations
-              .slice(0, 30)
-              .map(
-                (c) => `
-              <tr>
-                <td class="truncate" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</td>
-                <td><span class="badge">${escapeHtml(c.surface)}</span></td>
-                <td class="num"><strong>${formatNumber(c.tokens.totalTokens)}</strong></td>
-                <td class="num">${formatNumber(c.tokens.inputTokens)}</td>
-                <td class="num">${formatNumber(c.tokens.cacheReadTokens)}</td>
-                <td class="num">${formatNumber(c.tokens.outputTokens)}</td>
-                <td class="num">${c.tokens.cacheHitRate.toFixed(1)}%</td>
-                <td class="num">${c.shareOfAllTimePct.toFixed(1)}%</td>
-              </tr>`,
-              )
-              .join('')}
-          </tbody>
-        </table>
-      </div>
+      ${
+        snap.conversations.length === 0
+          ? '<p style="color:var(--text-secondary)">尚未扫描到包含 Token 记录的 Antigravity 会话。</p>'
+          : `<div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>会话标题</th>
+                    <th>项目</th>
+                    <th class="num">总 Tokens</th>
+                    <th class="num">峰值上下文</th>
+                    <th class="num">命中率</th>
+                    <th class="num">等效费</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${snap.conversations
+                    .slice(0, 30)
+                    .map(
+                      (c) => `
+                    <tr>
+                      <td class="truncate" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</td>
+                      <td><span class="badge">${escapeHtml(c.projectName)}</span></td>
+                      <td class="num"><strong>${formatNumber(c.tokens.totalTokens)}</strong></td>
+                      <td class="num">${formatNumber(c.peakContextTokens)}${c.contextBloatRisk ? ' <span class="badge warning">/compact</span>' : ''}</td>
+                      <td class="num">${c.tokens.cacheHitRate.toFixed(1)}%</td>
+                      <td class="num">${formatUsd(c.tokens.cost.estimatedApiCostUsd)}</td>
+                    </tr>`,
+                    )
+                    .join('')}
+                </tbody>
+              </table>
+            </div>`
+      }
     </div>
   `;
 }
@@ -607,7 +731,7 @@ function renderConversationsTab(snap: UsageSnapshot): string {
 function renderModelsTab(snap: UsageSnapshot): string {
   return `
     <div class="card">
-      <div class="card-title"><span>分模型 Token 统计</span></div>
+      <div class="card-title"><span>分模型 Token 与等效费用统计</span></div>
       <div class="table-wrap">
         <table>
           <thead>
@@ -616,8 +740,8 @@ function renderModelsTab(snap: UsageSnapshot): string {
               <th>所属池</th>
               <th class="num">轮次</th>
               <th class="num">总 Tokens</th>
-              <th class="num">加权 Tokens</th>
               <th class="num">缓存命中</th>
+              <th class="num">等效 API 费</th>
               <th class="num">占比</th>
             </tr>
           </thead>
@@ -630,8 +754,8 @@ function renderModelsTab(snap: UsageSnapshot): string {
                 <td><span class="badge">${escapeHtml(m.poolId)}</span></td>
                 <td class="num">${m.tokens.turns}</td>
                 <td class="num"><strong>${formatNumber(m.tokens.totalTokens)}</strong></td>
-                <td class="num">${formatNumber(m.tokens.weightedTokens)}</td>
                 <td class="num">${m.tokens.cacheHitRate.toFixed(1)}%</td>
+                <td class="num">${formatUsd(m.tokens.cost.estimatedApiCostUsd)}</td>
                 <td class="num">${m.shareOfAllTimePct.toFixed(1)}%</td>
               </tr>`,
               )
@@ -667,7 +791,7 @@ function renderSettingsTab(snap: UsageSnapshot): string {
   const cfg = snap.config;
   return `
     <div class="card">
-      <div class="card-title"><span>套餐预设、占空比与预警配置</span></div>
+      <div class="card-title"><span>套餐预设、占空比、预警与桌面通知配置</span></div>
       <form id="settings-form">
         <div class="settings-grid">
           <div class="field">
@@ -700,10 +824,17 @@ function renderSettingsTab(snap: UsageSnapshot): string {
             <input id="cfg-buffer" type="number" min="0" max="30" value="${cfg.safetyBufferPct}" />
           </div>
           <div class="field">
-            <label for="cfg-alerts">PostInvocation Hook 预警</label>
+            <label for="cfg-alerts">PostInvocation 对话内预警</label>
             <select id="cfg-alerts">
               <option value="true" ${cfg.alerts.enabled ? 'selected' : ''}>已开启</option>
               <option value="false" ${!cfg.alerts.enabled ? 'selected' : ''}>已关闭</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="cfg-desktop">原生桌面低额弹窗通知</label>
+            <select id="cfg-desktop">
+              <option value="true" ${cfg.alerts.desktopNotification ? 'selected' : ''}>已开启</option>
+              <option value="false" ${!cfg.alerts.desktopNotification ? 'selected' : ''}>已关闭</option>
             </select>
           </div>
           <div class="field">
@@ -740,6 +871,7 @@ function render(): void {
 
   let bodyHtml = '';
   if (activeTab === 'overview') bodyHtml = renderOverview(pool, snapshot);
+  else if (activeTab === 'simulate') bodyHtml = renderSimulateTab(pool, snapshot);
   else if (activeTab === 'trends') bodyHtml = renderTrendsTab(snapshot);
   else if (activeTab === 'conversations') bodyHtml = renderConversationsTab(snapshot);
   else if (activeTab === 'models') bodyHtml = renderModelsTab(snapshot);
@@ -762,8 +894,9 @@ function render(): void {
     <div class="controls-bar">
       <div class="pill-group" role="tablist">
         <button class="pill-btn ${activeTab === 'overview' ? 'active' : ''}" data-tab="overview">额度与预测</button>
+        <button class="pill-btn ${activeTab === 'simulate' ? 'active' : ''}" data-tab="simulate">模拟推演</button>
         <button class="pill-btn ${activeTab === 'trends' ? 'active' : ''}" data-tab="trends">24h/7d 趋势</button>
-        <button class="pill-btn ${activeTab === 'conversations' ? 'active' : ''}" data-tab="conversations">会话排行</button>
+        <button class="pill-btn ${activeTab === 'conversations' ? 'active' : ''}" data-tab="conversations">项目与会话</button>
         <button class="pill-btn ${activeTab === 'models' ? 'active' : ''}" data-tab="models">模型与工具</button>
         <button class="pill-btn ${activeTab === 'settings' ? 'active' : ''}" data-tab="settings">配置</button>
       </div>
@@ -850,6 +983,25 @@ function bindHandlers(): void {
     render();
   });
 
+  document.getElementById('btn-send-chat')?.addEventListener('click', async () => {
+    if (!canSendMessage || !snapshot) return;
+    const pool = getSelectedPool();
+    if (!pool) return;
+    const f = selectedWindow === 'short' ? pool.shortWindow : pool.weeklyWindow;
+    const summaryText = `请结合当前额度状态帮我规划接下来的开发节奏：${pool.displayName} 当前剩余 ${f.currentRemainingPct.toFixed(1)}%，下次刷新预计剩余 ${f.predictedRemainingPctAtReset.toFixed(1)}%，安全节奏 ≤ ${f.safeBurnRatePctPerHour.toFixed(1)}%/h，累计消耗 ${formatNumber(snapshot.totals.allTime.totalTokens)} tokens（缓存命中率 ${snapshot.totals.allTime.cacheHitRate.toFixed(1)}%）。`;
+    try {
+      await app.sendMessage({
+        role: 'user',
+        content: [{ type: 'text', text: summaryText }],
+      });
+      statusNotice = '已将额度状态发送至当前对话';
+      render();
+    } catch {
+      statusNotice = '当前视图不支持向对话发送消息';
+      render();
+    }
+  });
+
   document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((btn) => {
     btn.addEventListener('click', () => {
       activeTab = btn.dataset.tab as ActiveTab;
@@ -893,6 +1045,42 @@ function bindHandlers(): void {
     }
   });
 
+  const simForm = document.getElementById('sim-form') as HTMLFormElement | null;
+  simForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!hostConnected || isBusy) return;
+    const poolId = (document.getElementById('sim-pool') as HTMLSelectElement).value as PoolId;
+    simTurns = Number((document.getElementById('sim-turns') as HTMLInputElement).value);
+    simMinutes = Number((document.getElementById('sim-mins') as HTMLInputElement).value);
+    simOffloadPct = Number((document.getElementById('sim-offload') as HTMLInputElement).value);
+
+    isBusy = true;
+    statusNotice = '正在运行 What-If 推演...';
+    render();
+    try {
+      const res = await app.callServerTool({
+        name: 'app_simulate',
+        arguments: {
+          poolId,
+          windowKind: selectedWindow,
+          additionalTurns: simTurns,
+          additionalMinutes: simMinutes,
+          offloadToFlashPct: simOffloadPct,
+        },
+      });
+      const sc = (res as { structuredContent?: SimulationResult }).structuredContent;
+      if (sc) {
+        simulationResult = sc;
+        statusNotice = '推演完成';
+      }
+    } catch (err) {
+      statusNotice = `推演失败: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      isBusy = false;
+      render();
+    }
+  });
+
   const calForm = document.getElementById('cal-form') as HTMLFormElement | null;
   calForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -910,15 +1098,20 @@ function bindHandlers(): void {
         arguments: { poolId, windowKind, remainingPct, resetInMinutes },
       });
       const sc = (res as {
-        structuredContent?: { snapshot: UsageSnapshot; learnedUpdated: boolean; newTokensPerPct: number };
+        structuredContent?: {
+          snapshot: UsageSnapshot;
+          learnedUpdated: boolean;
+          newTokensPerPct: number;
+          absoluteErrorPct: number;
+        };
       }).structuredContent;
       if (sc?.snapshot) {
         snapshot = sc.snapshot;
         selectedPoolId = poolId;
         selectedWindow = windowKind;
         statusNotice = sc.learnedUpdated
-          ? `校准成功！已自学习新换算系数: 1% ≈ ${formatNumber(sc.newTokensPerPct)} 加权Tok`
-          : '锚点校准已保存';
+          ? `校准成功 (偏差 ${sc.absoluteErrorPct.toFixed(1)}%) · 自学习新系数 1%≈${formatNumber(sc.newTokensPerPct)}`
+          : `锚点已保存 (校准前偏差 ${sc.absoluteErrorPct.toFixed(1)}%)`;
       }
     } catch (err) {
       statusNotice = `校准失败: ${err instanceof Error ? err.message : String(err)}`;
@@ -962,6 +1155,7 @@ function bindHandlers(): void {
     const criticalRemainingPct = Number((document.getElementById('cfg-crit') as HTMLInputElement).value);
     const safetyBufferPct = Number((document.getElementById('cfg-buffer') as HTMLInputElement).value);
     const alertsEnabled = (document.getElementById('cfg-alerts') as HTMLSelectElement).value === 'true';
+    const desktopNotification = (document.getElementById('cfg-desktop') as HTMLSelectElement).value === 'true';
     const proShortBudget = Number((document.getElementById('cfg-pro-budget') as HTMLInputElement).value);
     const flashShortBudget = Number((document.getElementById('cfg-flash-budget') as HTMLInputElement).value);
 
@@ -977,6 +1171,7 @@ function bindHandlers(): void {
         warningRemainingPct,
         criticalRemainingPct,
         alertsEnabled,
+        desktopNotification,
       };
       if (plan === 'custom') {
         payload.proShortBudget = proShortBudget;
@@ -1046,6 +1241,8 @@ async function bootstrap(): Promise<void> {
   try {
     await app.connect();
     hostConnected = true;
+    const caps = app.getHostCapabilities();
+    canSendMessage = Boolean(caps && (caps as Record<string, unknown>).message);
     const ctx = app.getHostContext();
     if (ctx?.theme) applyDocumentTheme(ctx.theme);
     if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);

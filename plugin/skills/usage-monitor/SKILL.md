@@ -25,6 +25,9 @@ Use the `antigravity-usage-monitor` MCP server tools whenever the user asks abou
    - When the user shares their exact remaining percentage and reset countdown from `/usage` (e.g., "Gemini Pro 还剩 68%，2小时10分后刷新"), call `calibrate_quota` with `poolId`, `remainingPct`, and `resetInMinutes`.
    - Remind the user that calibrating twice within the same refresh window automatically learns their exact `weightedTokensPerPercent` multiplier.
 
-3. **Deep-Dive Token Optimization**:
-   - Call `get_conversation_breakdown` to inspect which conversations consume the most tokens and evaluate Prompt Cache hit rates.
-   - If the forecast predicts exhaustion before next refresh, highlight the `safeBurnRatePctPerHour` budget and suggest switching lightweight tasks to Gemini Flash.
+3. **What-If Scenario Simulation**:
+   - When the user asks "can I run 20 more turns before refresh?" or "how much quota do I save by offloading to Flash?", call `simulate_quota_scenario` with `additionalTurns` / `additionalMinutes` and `offloadToFlashPct`.
+
+4. **Deep-Dive Token, Cost & Context Optimization**:
+   - Call `get_conversation_breakdown` to inspect top conversations, per-project totals, API cost equivalents, and `contextBloatRisk` (suggest `/compact` when peak context exceeds 200K tokens).
+   - Call `export_usage_report` when the user wants a Markdown, CSV, or JSON report.

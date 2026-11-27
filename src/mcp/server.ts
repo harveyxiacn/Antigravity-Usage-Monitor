@@ -11,6 +11,7 @@ import {
   renderCsvReport,
   renderMarkdownReport,
   resetCalibrationAndSnapshot,
+  simulateWorkload,
   updateConfigAndSnapshot,
   type BrainRoot,
   type PlanId,
@@ -82,9 +83,10 @@ function formatSummaryMarkdown(snap: UsageSnapshot): string {
   const t = snap.totals;
   lines.push(
     '',
-    '### Token 消耗汇总',
+    '### Token 与等效 API 成本汇总',
     `- **累计总 Tokens (All-Time)**: **${t.allTime.totalTokens.toLocaleString()}** (${t.allTime.turns} 轮推理 · ${t.allTime.toolCalls} 次工具调用)`,
     `- **构成分解**: Fresh Input ${t.allTime.inputTokens.toLocaleString()} · Cache Read ${t.allTime.cacheReadTokens.toLocaleString()} (**命中率 ${t.allTime.cacheHitRate.toFixed(1)}%**, 节省约 ${t.allTime.savedByCacheTokens.toLocaleString()}) · Output ${t.allTime.outputTokens.toLocaleString()}`,
+    `- **等效 API 费用**: 净成本 **$${t.allTime.cost.estimatedApiCostUsd.toFixed(2)}**（无缓存原价 $${t.allTime.cost.withoutCacheCostUsd.toFixed(2)} · 缓存省下 **$${t.allTime.cost.cacheSavingsUsd.toFixed(2)}**）`,
     `- **本 5h 窗口 / 今日 / 7天**: ${t.shortWindow.totalTokens.toLocaleString()} / ${t.today.totalTokens.toLocaleString()} / ${t.weeklyWindow.totalTokens.toLocaleString()}`,
   );
 
@@ -102,7 +104,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
   const server = new McpServer(
     {
       name: 'antigravity-usage-monitor',
-      version: '1.1.0',
+      version: '1.2.0',
     },
     {
       capabilities: {
@@ -125,7 +127,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     APP_RESOURCE_URI,
     {
       description:
-        'Interactive quota monitor, next-refresh remaining % forecaster, 24h usage trends, and token analytics dashboard.',
+        'Interactive quota monitor, next-refresh remaining % forecaster, What-If workload simulator, project cost analytics, and 24h trends dashboard.',
       mimeType: APP_MIME_TYPE,
       _meta: {
         ui: {
@@ -150,7 +152,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     {
       title: 'Usage Monitor',
       description:
-        'Open the interactive Antigravity Usage Monitor dashboard in the side pane or sidebar, showing real-time quota, predicted remaining % at next refresh, 24h trends, and total token analytics.',
+        'Open the interactive Antigravity Usage Monitor dashboard in the side pane or sidebar, showing real-time quota, predicted remaining % at next refresh, What-If simulator, project cost breakdown, and total token analytics.',
       inputSchema: {
         poolId: z
           .enum(['gemini-pro', 'gemini-flash', 'partner'])
@@ -178,13 +180,13 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     },
   );
 
-  // 3. Inline Summary Tool: get_usage_summary
+  // 3. Inline Summary Tool
   server.registerTool(
     'get_usage_summary',
     {
       title: 'Get Antigravity Usage Summary & Refresh Forecast',
       description:
-        'Get a detailed quota summary, predicted remaining percentage at next refresh (5h & 7d windows), burn rate, smart recommendations, and total token statistics rendered inline.',
+        'Get a detailed quota summary, predicted remaining percentage at next refresh (5h & 7d windows), API cost equivalent & cache savings, burn rate, and smart recommendations rendered inline.',
       inputSchema: {},
       _meta: {
         ui: {
@@ -207,7 +209,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     {
       title: 'Calibrate Quota Anchor from /usage',
       description:
-        'Calibrate a model pool against Antigravity native /usage or Settings -> Models (remaining % and minutes until next refresh). Calibrating twice in the same window auto-learns the exact tokens-per-percent ratio.',
+        'Calibrate a model pool against Antigravity native /usage or Settings -> Models (remaining % and minutes until next refresh). Records prediction error and auto-learns exact tokens-per-percent ratio.',
       inputSchema: {
         poolId: z.enum(['gemini-pro', 'gemini-flash', 'partner']).describe('Target model quota pool'),
         windowKind: z
@@ -236,6 +238,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
         },
         collectOpts(),
       );
+      const errNote = `（校准前预测 ${res.predictedPctBefore.toFixed(1)}%，偏差 ${res.absoluteErrorPct.toFixed(1)}%）`;
       const learnedNote = res.learnedUpdated
         ? `\n已通过同周期两点校准自动更新换算系数: 1% 额度 ≈ ${res.newTokensPerPct.toLocaleString()} 加权 Tokens（原 ${res.previousTokensPerPct.toLocaleString()}）。`
         : '';
@@ -243,7 +246,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
         content: [
           {
             type: 'text',
-            text: `已校准 **${args.poolId}** (${args.windowKind ?? 'short'})：当前余量 ${args.remainingPct}%。${learnedNote}\n\n${formatSummaryMarkdown(res.snapshot)}`,
+            text: `已校准 **${args.poolId}** (${args.windowKind ?? 'short'})：当前余量 ${args.remainingPct}% ${errNote}。${learnedNote}\n\n${formatSummaryMarkdown(res.snapshot)}`,
           },
         ],
         structuredContent: res as unknown as Record<string, unknown>,
@@ -251,13 +254,56 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     },
   );
 
-  // 5. Configure Monitor Tool
+  // 5. What-If Workload Simulation Tool
+  server.registerTool(
+    'simulate_quota_scenario',
+    {
+      title: 'Simulate What-If Quota Workload',
+      description:
+        'Simulate how much quota will remain if you run N additional turns or M additional coding minutes, optionally offloading a percentage of work to Gemini Flash.',
+      inputSchema: {
+        poolId: z.enum(['gemini-pro', 'gemini-flash', 'partner']).optional(),
+        windowKind: z.enum(['short', 'weekly']).optional().default('short'),
+        additionalTurns: z.number().int().min(0).max(500).optional(),
+        additionalMinutes: z.number().min(0).max(1440).optional(),
+        offloadToFlashPct: z.number().min(0).max(100).optional().default(0),
+      },
+    },
+    async (args) => {
+      const snapshot = await collectUsageSnapshot(collectOpts());
+      const sim = simulateWorkload(snapshot, {
+        poolId: args.poolId as PoolId | undefined,
+        windowKind: (args.windowKind ?? 'short') as WindowKind,
+        additionalTurns: args.additionalTurns,
+        additionalMinutes: args.additionalMinutes,
+        offloadToFlashPct: args.offloadToFlashPct,
+      });
+      const text = [
+        `### 负载模拟推演结果 (${sim.poolId} / ${sim.windowKind})`,
+        `- **当前余量**: ${sim.baselineRemainingPct.toFixed(1)}%`,
+        `- **计划新增消耗**: ${sim.simulatedAddedWeightedTokens.toLocaleString()} 加权 Tokens（约 ${sim.simulatedAddedPct.toFixed(1)}%）`,
+        `- **全量主力池执行后余量**: **${sim.remainingAfterWorkloadPct.toFixed(1)}%** (${sim.survivesUntilReset ? '✅ 可撑到刷新' : '🔴 将提前耗尽'})`,
+        ...(sim.offloadToFlashPct > 0
+          ? [
+              `- **分流 ${sim.offloadToFlashPct}% 至 Gemini Flash 后余量**: **${sim.withOffloadRemainingPct.toFixed(1)}%**（为主力池省下 **${sim.savedPrimaryPct.toFixed(1)}%**，Flash 池仅消耗 ${sim.flashImpactPct.toFixed(1)}%）`,
+            ]
+          : []),
+        `- **建议**: ${sim.recommendation}`,
+      ].join('\n');
+      return {
+        content: [{ type: 'text', text }],
+        structuredContent: sim as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  // 6. Configure Monitor Tool
   server.registerTool(
     'configure_monitor',
     {
       title: 'Configure Antigravity Usage Monitor',
       description:
-        'Update subscription plan preset (free, ai-pro, ai-ultra, custom), window duration, duty cycle prior, custom pool budgets, or alert thresholds.',
+        'Update subscription plan preset, window duration, duty cycle prior, custom pool budgets, alert thresholds, or native desktop notifications.',
       inputSchema: {
         plan: z.enum(['free', 'ai-pro', 'ai-ultra', 'custom']).optional(),
         shortWindowMinutes: z.number().min(30).max(1440).optional(),
@@ -266,6 +312,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
         warningRemainingPct: z.number().min(1).max(80).optional(),
         criticalRemainingPct: z.number().min(1).max(50).optional(),
         alertsEnabled: z.boolean().optional(),
+        desktopNotification: z.boolean().optional(),
         proShortBudget: z.number().positive().optional(),
         flashShortBudget: z.number().positive().optional(),
         partnerShortBudget: z.number().positive().optional(),
@@ -273,20 +320,6 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     },
     async (args) => {
       const current = await collectUsageSnapshot(collectOpts());
-      const budgets = {
-        'gemini-pro': {
-          ...current.config.poolBudgets['gemini-pro'],
-          ...(args.proShortBudget ? { shortWeightedTokens: args.proShortBudget } : {}),
-        },
-        'gemini-flash': {
-          ...current.config.poolBudgets['gemini-flash'],
-          ...(args.flashShortBudget ? { shortWeightedTokens: args.flashShortBudget } : {}),
-        },
-        partner: {
-          ...current.config.poolBudgets.partner,
-          ...(args.partnerShortBudget ? { shortWeightedTokens: args.partnerShortBudget } : {}),
-        },
-      };
       const hasCustomBudget = Boolean(
         args.proShortBudget || args.flashShortBudget || args.partnerShortBudget,
       );
@@ -296,7 +329,26 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
           ...(args.shortWindowMinutes ? { shortWindowMinutes: args.shortWindowMinutes } : {}),
           ...(args.safetyBufferPct !== undefined ? { safetyBufferPct: args.safetyBufferPct } : {}),
           ...(args.dutyCyclePrior !== undefined ? { dutyCyclePrior: args.dutyCyclePrior } : {}),
-          ...(hasCustomBudget ? { poolBudgets: budgets } : {}),
+          ...(hasCustomBudget
+            ? {
+                poolBudgets: {
+                  'gemini-pro': {
+                    ...current.config.poolBudgets['gemini-pro'],
+                    ...(args.proShortBudget ? { shortWeightedTokens: args.proShortBudget } : {}),
+                  },
+                  'gemini-flash': {
+                    ...current.config.poolBudgets['gemini-flash'],
+                    ...(args.flashShortBudget ? { shortWeightedTokens: args.flashShortBudget } : {}),
+                  },
+                  partner: {
+                    ...current.config.poolBudgets.partner,
+                    ...(args.partnerShortBudget
+                      ? { shortWeightedTokens: args.partnerShortBudget }
+                      : {}),
+                  },
+                },
+              }
+            : {}),
           alerts: {
             ...current.config.alerts,
             ...(args.warningRemainingPct !== undefined
@@ -306,6 +358,9 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
               ? { criticalRemainingPct: args.criticalRemainingPct }
               : {}),
             ...(args.alertsEnabled !== undefined ? { enabled: args.alertsEnabled } : {}),
+            ...(args.desktopNotification !== undefined
+              ? { desktopNotification: args.desktopNotification }
+              : {}),
           },
         },
         collectOpts(),
@@ -314,7 +369,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
         content: [
           {
             type: 'text',
-            text: `配置已更新：套餐=${snapshot.plan}，占空比先验=${Math.round(snapshot.config.dutyCyclePrior * 100)}%，预警线=${snapshot.config.alerts.warningRemainingPct}%，高危线=${snapshot.config.alerts.criticalRemainingPct}%，Hook 预警=${snapshot.config.alerts.enabled ? '开' : '关'}。`,
+            text: `配置已更新：套餐=${snapshot.plan}，占空比先验=${Math.round(snapshot.config.dutyCyclePrior * 100)}%，预警线=${snapshot.config.alerts.warningRemainingPct}%，桌面弹窗=${snapshot.config.alerts.desktopNotification ? '开' : '关'}。`,
           },
         ],
         structuredContent: snapshot as unknown as Record<string, unknown>,
@@ -322,13 +377,13 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     },
   );
 
-  // 6. Conversation Breakdown Tool
+  // 7. Conversation & Project Breakdown Tool
   server.registerTool(
     'get_conversation_breakdown',
     {
-      title: 'Get Per-Conversation Token Breakdown',
+      title: 'Get Per-Conversation & Per-Project Token Breakdown',
       description:
-        'List the highest token-consuming Antigravity conversations with Fresh Input, Cache Read, Output tokens, and cache hit efficiency.',
+        'List the highest token-consuming Antigravity conversations and projects with Fresh Input, Cache Read, Output tokens, peak context bloat diagnostics, and API cost estimates.',
       inputSchema: {
         limit: z.number().int().min(1).max(50).optional().default(10),
       },
@@ -338,7 +393,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
       const top = snapshot.conversations.slice(0, args.limit ?? 10);
       const rows = top.map(
         (c, idx) =>
-          `${idx + 1}. **${c.title}** (${c.surface}) — **${c.tokens.totalTokens.toLocaleString()}** tokens (In ${c.tokens.inputTokens.toLocaleString()} / Cache ${c.tokens.cacheReadTokens.toLocaleString()} [${c.tokens.cacheHitRate}%] / Out ${c.tokens.outputTokens.toLocaleString()}, 占比 ${c.shareOfAllTimePct}%)`,
+          `${idx + 1}. **${c.title}** [${c.projectName}] — **${c.tokens.totalTokens.toLocaleString()}** tokens (峰值上下文 ${(c.peakContextTokens / 1000).toFixed(0)}K${c.contextBloatRisk ? ' ⚠️建议/compact' : ''}, 缓存 ${c.tokens.cacheHitRate}%, 等效 $${c.tokens.cost.estimatedApiCostUsd.toFixed(2)})`,
       );
       return {
         content: [
@@ -353,18 +408,19 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
         structuredContent: {
           totalConversations: snapshot.conversations.length,
           conversations: top,
+          projects: snapshot.projects,
           topTools: snapshot.topTools,
         },
       };
     },
   );
 
-  // 7. Export Usage Report Tool (Markdown / CSV / JSON)
+  // 8. Export Usage Report Tool
   server.registerTool(
     'export_usage_report',
     {
       title: 'Export Usage & Forecast Report',
-      description: 'Export a formatted Markdown, CSV, or JSON usage and refresh forecast report.',
+      description: 'Export a formatted Markdown, CSV, or JSON usage, cost, and refresh forecast report.',
       inputSchema: {
         format: z.enum(['markdown', 'csv', 'json']).optional().default('markdown'),
       },
@@ -385,7 +441,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
     },
   );
 
-  // 8. App-Only Tools (hidden from model, callable exclusively by MCP App iframe)
+  // 9. App-Only Tools (hidden from model, callable exclusively by MCP App iframe)
   server.registerTool(
     'app_get_snapshot',
     {
@@ -458,6 +514,36 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
   );
 
   server.registerTool(
+    'app_simulate',
+    {
+      title: 'App Simulate Scenario',
+      description: 'App-only tool to run What-If workload simulation.',
+      inputSchema: {
+        poolId: z.enum(['gemini-pro', 'gemini-flash', 'partner']).optional(),
+        windowKind: z.enum(['short', 'weekly']).optional().default('short'),
+        additionalTurns: z.number().int().min(0).max(500).optional(),
+        additionalMinutes: z.number().min(0).max(1440).optional(),
+        offloadToFlashPct: z.number().min(0).max(100).optional().default(0),
+      },
+      _meta: { ui: { visibility: ['app'] } },
+    },
+    async (args) => {
+      const snapshot = await collectUsageSnapshot(collectOpts());
+      const result = simulateWorkload(snapshot, {
+        poolId: args.poolId as PoolId | undefined,
+        windowKind: (args.windowKind ?? 'short') as WindowKind,
+        additionalTurns: args.additionalTurns,
+        additionalMinutes: args.additionalMinutes,
+        offloadToFlashPct: args.offloadToFlashPct,
+      });
+      return {
+        content: [{ type: 'text', text: 'simulated' }],
+        structuredContent: result as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  server.registerTool(
     'app_save_config',
     {
       title: 'App Save Config',
@@ -470,6 +556,7 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
         warningRemainingPct: z.number().min(1).max(80).optional(),
         criticalRemainingPct: z.number().min(1).max(50).optional(),
         alertsEnabled: z.boolean().optional(),
+        desktopNotification: z.boolean().optional(),
         proShortBudget: z.number().positive().optional(),
         flashShortBudget: z.number().positive().optional(),
         partnerShortBudget: z.number().positive().optional(),
@@ -516,6 +603,9 @@ export function createUsageMonitorServer(options: UsageServerOptions = {}): McpS
               ? { criticalRemainingPct: args.criticalRemainingPct }
               : {}),
             ...(args.alertsEnabled !== undefined ? { enabled: args.alertsEnabled } : {}),
+            ...(args.desktopNotification !== undefined
+              ? { desktopNotification: args.desktopNotification }
+              : {}),
           },
         },
         collectOpts(),

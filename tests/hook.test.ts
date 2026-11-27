@@ -54,6 +54,7 @@ describe('PostInvocation Quota Alert Hook', () => {
         dataDir,
         nowMs,
         overrideRoots: [{ surface: 'antigravity', dirPath: brainDir }],
+        enableDesktopNotify: false,
       },
     );
 
@@ -79,6 +80,7 @@ describe('PostInvocation Quota Alert Hook', () => {
         dataDir,
         nowMs: nowMs + 20 * 60_000,
         overrideRoots: [{ surface: 'antigravity', dirPath: brainDir }],
+        enableDesktopNotify: false,
       },
     );
     expect(third.injectSteps).toHaveLength(1);

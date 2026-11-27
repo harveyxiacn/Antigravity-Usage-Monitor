@@ -127,6 +127,22 @@ describe('MCP Server & MCP App Protocol', () => {
       const reportData = reportRes.structuredContent as { format: string; report: string };
       expect(reportData.format).toBe('markdown');
       expect(reportData.report).toContain('Antigravity Usage & Quota Forecast Report');
+
+      // 6. Run What-If workload simulation via simulate_quota_scenario tool
+      const simRes = await client.callTool({
+        name: 'simulate_quota_scenario',
+        arguments: {
+          poolId: 'gemini-pro',
+          additionalTurns: 10,
+          offloadToFlashPct: 50,
+        },
+      });
+      const simData = simRes.structuredContent as {
+        savedPrimaryPct: number;
+        withOffloadRemainingPct: number;
+      };
+      expect(simData.withOffloadRemainingPct).toBeGreaterThan(0);
+      expect(simData.savedPrimaryPct).toBeGreaterThan(0);
     } finally {
       await client.close();
       await server.close();

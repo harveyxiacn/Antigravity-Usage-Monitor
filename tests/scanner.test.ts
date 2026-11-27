@@ -42,7 +42,10 @@ describe('Incremental Transcript Scanner', () => {
         input_tokens: 12000,
         cache_read_tokens: 30000,
         output_tokens: 1500,
-        tool_calls: [{ name: 'read_file' }, { name: 'write_file' }],
+        tool_calls: [
+          { name: 'read_file', args: { Path: '/workspace/sample-project/src/core/engine.ts' } },
+          { name: 'write_file' },
+        ],
       }),
       JSON.stringify({
         step_index: 2,
@@ -66,6 +69,7 @@ describe('Incremental Transcript Scanner', () => {
     expect(first.events[0].poolId).toBe('gemini-pro');
     expect(first.events[0].toolNames).toEqual(['read_file', 'write_file']);
     expect(first.conversations.get(convId)?.title).toBe('实现额度监控与预测功能');
+    expect(first.conversations.get(convId)?.projectName).toBe('sample-project');
 
     // Second scan with no file changes should hit cache
     const second = scanTranscripts(config, first.cache, [

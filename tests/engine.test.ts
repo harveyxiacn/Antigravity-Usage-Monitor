@@ -63,6 +63,7 @@ describe('Dual-Window Quota & Forecast Engine', () => {
           conversationId: 'conv-main',
           surface: 'antigravity',
           title: 'Core Monitor Build',
+          projectName: 'Antigravity-Usage-Monitor',
           firstTimestampMs: events[0].timestampMs,
           lastTimestampMs: events[events.length - 1].timestampMs,
           transcriptPath: '/tmp/transcript.jsonl',
@@ -178,6 +179,8 @@ describe('Dual-Window Quota & Forecast Engine', () => {
     expect(pro.shortWindow.calibrated).toBe(true);
     expect(pro.shortWindow.currentRemainingPct).toBeCloseTo(69.0, 1);
     expect(pro.shortWindow.tokensPerPct).toBe(34_000);
+    expect(snapshot.calibrationAccuracy.totalCalibrations).toBe(2);
+    expect(snapshot.calibrationAccuracy.meanAbsoluteErrorPct).not.toBeNull();
   });
 
   it('regularizes cold-start bursts via duty-cycle prior, generates 24h/7d trends, recommendations, and Markdown/CSV reports', () => {

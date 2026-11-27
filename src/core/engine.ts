@@ -1,15 +1,19 @@
 import {
   ALL_POOLS,
+  DEFAULT_PRICING,
   POOL_DISPLAY_NAMES,
   calibrationKey,
 } from './config.js';
 import type {
   BurnRateEstimate,
+  CalibrationAccuracySummary,
   CalibrationAnchor,
+  CalibrationHistoryEntry,
   CalibrationInput,
   ConfidenceLevel,
   ConversationMeta,
   ConversationSummary,
+  CostBreakdown,
   DailyBucket,
   ForecastResult,
   HealthStatus,
@@ -18,7 +22,9 @@ import type {
   MonitorConfig,
   PersistentState,
   PoolId,
+  PoolPricingUsdPer1M,
   PoolSnapshot,
+  ProjectUsageSummary,
   SmartRecommendation,
   TimelinePoint,
   TokenTotals,
@@ -31,6 +37,7 @@ import type {
 const MS_PER_MINUTE = 60_000;
 const MS_PER_HOUR = 3_600_000;
 const MS_PER_DAY = 86_400_000;
+const CONTEXT_BLOAT_THRESHOLD = 200_000;
 
 export function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
@@ -45,6 +52,18 @@ export function round2(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
+export function round4(value: number): number {
+  return Math.round(value * 10000) / 10000;
+}
+
+export function createEmptyCost(): CostBreakdown {
+  return {
+    estimatedApiCostUsd: 0,
+    withoutCacheCostUsd: 0,
+    cacheSavingsUsd: 0,
+  };
+}
+
 export function createEmptyTotals(): TokenTotals {
   return {
     inputTokens: 0,
@@ -56,10 +75,15 @@ export function createEmptyTotals(): TokenTotals {
     savedByCacheTokens: 0,
     turns: 0,
     toolCalls: 0,
+    cost: createEmptyCost(),
   };
 }
 
-export function aggregateTokens(events: UsageEvent[], cacheReadWeight = 0.1): TokenTotals {
+export function aggregateTokens(
+  events: UsageEvent[],
+  cacheReadWeight = 0.1,
+  pricing: Record<PoolId, PoolPricingUsdPer1M> = DEFAULT_PRICING,
+): TokenTotals {
   if (events.length === 0) return createEmptyTotals();
   let inputTokens = 0;
   let cacheReadTokens = 0;
@@ -67,6 +91,8 @@ export function aggregateTokens(events: UsageEvent[], cacheReadWeight = 0.1): To
   let totalTokens = 0;
   let weightedTokens = 0;
   let toolCalls = 0;
+  let estimatedApiCostUsd = 0;
+  let withoutCacheCostUsd = 0;
 
   for (const ev of events) {
     inputTokens += ev.inputTokens;
@@ -75,11 +101,23 @@ export function aggregateTokens(events: UsageEvent[], cacheReadWeight = 0.1): To
     totalTokens += ev.totalTokens;
     weightedTokens += ev.weightedTokens;
     toolCalls += ev.toolNames.length;
+
+    const p = pricing[ev.poolId] ?? DEFAULT_PRICING['gemini-pro'];
+    const netCost =
+      (ev.inputTokens / 1_000_000) * p.inputPer1M +
+      (ev.cacheReadTokens / 1_000_000) * p.cacheReadPer1M +
+      (ev.outputTokens / 1_000_000) * p.outputPer1M;
+    const noCacheCost =
+      ((ev.inputTokens + ev.cacheReadTokens) / 1_000_000) * p.inputPer1M +
+      (ev.outputTokens / 1_000_000) * p.outputPer1M;
+    estimatedApiCostUsd += netCost;
+    withoutCacheCostUsd += noCacheCost;
   }
 
   const totalPromptTokens = inputTokens + cacheReadTokens;
   const cacheHitRate = totalPromptTokens > 0 ? round1((cacheReadTokens / totalPromptTokens) * 100) : 0;
   const savedByCacheTokens = Math.round(cacheReadTokens * (1 - cacheReadWeight));
+  const cacheSavingsUsd = Math.max(0, withoutCacheCostUsd - estimatedApiCostUsd);
 
   return {
     inputTokens,
@@ -91,6 +129,11 @@ export function aggregateTokens(events: UsageEvent[], cacheReadWeight = 0.1): To
     savedByCacheTokens,
     turns: events.length,
     toolCalls,
+    cost: {
+      estimatedApiCostUsd: round4(estimatedApiCostUsd),
+      withoutCacheCostUsd: round4(withoutCacheCostUsd),
+      cacheSavingsUsd: round4(cacheSavingsUsd),
+    },
   };
 }
 
@@ -111,9 +154,6 @@ export function getDefaultTokensPerPct(
   return Math.max(100, totalBudget / 100);
 }
 
-/**
- * Resolves the active window boundaries [windowStartMs, nextResetAtMs] for a pool & windowKind.
- */
 export function resolveWindowBounds(
   events: UsageEvent[],
   windowDurationMs: number,
@@ -126,7 +166,6 @@ export function resolveWindowBounds(
     return { windowStartMs, nextResetAtMs, anchorActive: true };
   }
 
-  // Rolling window: look back windowDurationMs from now
   const lookbackStart = nowMs - windowDurationMs;
   const inLookback = events.filter((e) => e.timestampMs >= lookbackStart && e.timestampMs <= nowMs);
   if (inLookback.length > 0) {
@@ -183,7 +222,6 @@ export function computeBurnRate(
   const idleMs = Math.max(0, nowMs - lastEventMs);
   const idleMinutesSinceLastEvent = round1(idleMs / MS_PER_MINUTE);
 
-  // Build equal-width buckets across [spanStartMs, nowMs]
   const bucketCount = Math.max(1, Math.ceil(elapsedMs / bucketMs));
   const bucketWeighted = new Array<number>(bucketCount).fill(0);
 
@@ -215,29 +253,24 @@ export function computeBurnRate(
     Math.min(elapsedMinutesInWindow, activeBucketRates.length * config.bucketMinutes),
   );
 
-  // 1. Recent burn rate (over recentMinutes or elapsed if shorter)
   const effectiveRecentHours = Math.max(
     bucketHours,
     Math.min(recentMs, elapsedMs) / MS_PER_HOUR,
   );
   const recentPctPerHour = recentWeighted / tokensPerPct / effectiveRecentHours;
 
-  // 2. EWMA across active buckets (rate while actively invoking model)
   const alpha = clamp(config.ewmaAlpha, 0.05, 0.9);
   let ewmaActive = activeBucketRates[0] ?? 0;
   for (let i = 1; i < activeBucketRates.length; i++) {
     ewmaActive = alpha * activeBucketRates[i] + (1 - alpha) * ewmaActive;
   }
 
-  // 3. Window wall-clock average rate
   const windowElapsedHours = Math.max(bucketHours, elapsedMs / MS_PER_HOUR);
   const windowAvgPctPerHour = totalWeightedInWindow / tokensPerPct / windowElapsedHours;
 
-  // Continuous active throttle rate (if coding non-stop)
   const rawActivePctPerHour =
     0.65 * ewmaActive + 0.35 * Math.max(recentPctPerHour, ewmaActive * 0.5);
 
-  // Adaptive duty-cycle regularization (prevents cold-start bursts from extrapolating 100% throttle across 5h or 7d)
   const observedDutyCycle = clamp(
     activeMinutesInWindow / Math.max(config.bucketMinutes, elapsedMinutesInWindow),
     0.02,
@@ -255,7 +288,6 @@ export function computeBurnRate(
     1.0,
   );
 
-  // Idle decay: if idle > 15 min, decay expected continuing rate with half-life
   const halfLifeMin = Math.max(10, config.idleDecayHalfLifeMinutes);
   const effectiveIdleMin = Math.max(0, idleMinutesSinceLastEvent - 15);
   const decayFactor =
@@ -263,7 +295,6 @@ export function computeBurnRate(
 
   const blendedPctPerHour = rawActivePctPerHour * effectiveDutyCycle * decayFactor;
 
-  // Volatility (standard deviation of active bucket rates scaled by effective duty cycle)
   let stdDevPctPerHour = 0;
   if (activeBucketRates.length >= 2) {
     const mean =
@@ -379,7 +410,6 @@ export function computeWindowForecast(
   const timeToResetMs = Math.max(0, nextResetAtMs - nowMs);
   const hoursToReset = timeToResetMs / MS_PER_HOUR;
 
-  // Expected (duty-cycle regularized), optimistic (P10), conservative (P90)
   const expectedBurn = burnRate.blendedPctPerHour * hoursToReset;
   const optimisticRate = Math.max(0, burnRate.blendedPctPerHour - 0.8 * burnRate.stdDevPctPerHour);
   const conservativeRate =
@@ -591,7 +621,11 @@ export function buildHourlyTrend24h(events: UsageEvent[], nowMs: number): Hourly
   return buckets;
 }
 
-export function buildDailyTrend7d(events: UsageEvent[], nowMs: number): DailyBucket[] {
+export function buildDailyTrend7d(
+  events: UsageEvent[],
+  nowMs: number,
+  config: MonitorConfig,
+): DailyBucket[] {
   const todayStart = new Date(nowMs);
   todayStart.setHours(0, 0, 0, 0);
   const firstDayStart = todayStart.getTime() - 6 * MS_PER_DAY;
@@ -613,7 +647,7 @@ export function buildDailyTrend7d(events: UsageEvent[], nowMs: number): DailyBuc
 
   return keys.map((dateKey) => {
     const dayEvents = map.get(dateKey) ?? [];
-    const totals = aggregateTokens(dayEvents);
+    const totals = aggregateTokens(dayEvents, config.weights.cacheReadWeight, config.pricing);
     return {
       dateKey,
       totalTokens: totals.totalTokens,
@@ -621,6 +655,7 @@ export function buildDailyTrend7d(events: UsageEvent[], nowMs: number): DailyBuc
       cacheHitRate: totals.cacheHitRate,
       turns: totals.turns,
       toolCalls: totals.toolCalls,
+      estimatedApiCostUsd: totals.cost.estimatedApiCostUsd,
     };
   });
 }
@@ -629,6 +664,7 @@ export function buildSmartRecommendations(
   pools: PoolSnapshot[],
   primaryPool: PoolSnapshot,
   allTime: TokenTotals,
+  conversations: ConversationSummary[],
 ): SmartRecommendation[] {
   const recs: SmartRecommendation[] = [];
   const f = primaryPool.shortWindow;
@@ -663,6 +699,16 @@ export function buildSmartRecommendations(
     });
   }
 
+  const bloated = conversations.find((c) => c.contextBloatRisk);
+  if (bloated) {
+    recs.push({
+      id: 'context-bloat',
+      severity: 'warning',
+      title: `检测到上下文膨胀会话（单轮峰值 ${(bloated.peakContextTokens / 1000).toFixed(0)}K）`,
+      detail: `会话「${bloated.title.slice(0, 28)}」单轮提示词已超过 200K tokens。建议在对话中运行 /compact 压缩上下文或拆分新对话，可立竿见影降低单轮额度消耗。`,
+    });
+  }
+
   if (!f.calibrated && primaryPool.shortTokens.turns > 0) {
     recs.push({
       id: 'calibrate-hint',
@@ -678,8 +724,8 @@ export function buildSmartRecommendations(
       recs.push({
         id: 'cache-great',
         severity: 'info',
-        title: `Prompt Cache 效率优秀（${allTime.cacheHitRate.toFixed(1)}%）`,
-        detail: `缓存已累计帮你节省约 ${allTime.savedByCacheTokens.toLocaleString()} 个等效输入 Token，大幅延长了单次 5h 窗口的可执行轮次。`,
+        title: `Prompt Cache 效率优秀（${allTime.cacheHitRate.toFixed(1)}%，省下 $${allTime.cost.cacheSavingsUsd.toFixed(2)}）`,
+        detail: `缓存已累计帮你节省约 ${allTime.savedByCacheTokens.toLocaleString()} 个等效输入 Token（等效 API 费用节省约 $${allTime.cost.cacheSavingsUsd.toFixed(2)} USD）。`,
       });
     } else if (allTime.cacheHitRate < 45) {
       recs.push({
@@ -694,16 +740,42 @@ export function buildSmartRecommendations(
   return recs.slice(0, 4);
 }
 
+export function buildCalibrationAccuracy(
+  history: CalibrationHistoryEntry[],
+): CalibrationAccuracySummary {
+  const recentRecords = history.slice(-20).reverse();
+  if (history.length === 0) {
+    return {
+      totalCalibrations: 0,
+      meanAbsoluteErrorPct: null,
+      recentRecords: [],
+    };
+  }
+  const sumErr = history.reduce((acc, h) => acc + h.absoluteErrorPct, 0);
+  return {
+    totalCalibrations: history.length,
+    meanAbsoluteErrorPct: round2(sumErr / history.length),
+    recentRecords,
+  };
+}
+
 /**
  * Applies user calibration from Antigravity's native /usage or Settings -> Models.
- * Automatically refines tokensPerPct if a previous calibration exists in the same window.
+ * Records accuracy error before updating and refines tokensPerPct on same-window pairs.
  */
 export function applyCalibration(
   state: PersistentState,
   events: UsageEvent[],
   input: CalibrationInput,
   nowMs: number = Date.now(),
-): { anchor: CalibrationAnchor; learnedUpdated: boolean; previousTokensPerPct: number; newTokensPerPct: number } {
+): {
+  anchor: CalibrationAnchor;
+  learnedUpdated: boolean;
+  previousTokensPerPct: number;
+  newTokensPerPct: number;
+  predictedPctBefore: number;
+  absoluteErrorPct: number;
+} {
   const windowKind: WindowKind = input.windowKind ?? 'short';
   const remainingPct = round1(clamp(input.remainingPct, 0, 100));
   const windowDurationMs = getWindowDurationMs(state.config, windowKind);
@@ -712,7 +784,11 @@ export function applyCalibration(
   if (input.nextResetAtIso) {
     const parsed = Date.parse(input.nextResetAtIso);
     nextResetAtMs = Number.isFinite(parsed) && parsed > nowMs ? parsed : nowMs + windowDurationMs;
-  } else if (typeof input.resetInMinutes === 'number' && Number.isFinite(input.resetInMinutes) && input.resetInMinutes > 0) {
+  } else if (
+    typeof input.resetInMinutes === 'number' &&
+    Number.isFinite(input.resetInMinutes) &&
+    input.resetInMinutes > 0
+  ) {
     nextResetAtMs = Math.round(nowMs + input.resetInMinutes * MS_PER_MINUTE);
   } else {
     nextResetAtMs = nowMs + windowDurationMs;
@@ -720,10 +796,22 @@ export function applyCalibration(
 
   const key = calibrationKey(input.poolId, windowKind);
   const prev = state.calibrations[key];
+  const poolEvents = events.filter((e) => e.poolId === input.poolId && e.timestampMs <= nowMs);
+
+  // Measure our model's predicted remaining % right BEFORE applying this calibration
+  const priorEval = computeWindowForecast(
+    poolEvents,
+    input.poolId,
+    windowKind,
+    nowMs,
+    state.config,
+    prev,
+  );
+  const predictedPctBefore = priorEval.forecast.currentRemainingPct;
+  const absoluteErrorPct = round1(Math.abs(predictedPctBefore - remainingPct));
+
   const defaultTpp = getDefaultTokensPerPct(state.config, input.poolId, windowKind);
   const previousTokensPerPct = prev?.learnedTokensPerPct ?? defaultTpp;
-
-  const poolEvents = events.filter((e) => e.poolId === input.poolId && e.timestampMs <= nowMs);
   const cumulativeWeighted = poolEvents.reduce((acc, e) => acc + e.weightedTokens, 0);
 
   let learnedTokensPerPct = prev?.learnedTokensPerPct;
@@ -761,11 +849,31 @@ export function applyCalibration(
   };
 
   state.calibrations[key] = anchor;
+  if (!Array.isArray(state.calibrationHistory)) {
+    state.calibrationHistory = [];
+  }
+  state.calibrationHistory.push({
+    timestampMs: nowMs,
+    timestampIso: new Date(nowMs).toISOString(),
+    poolId: input.poolId,
+    windowKind,
+    predictedPctBefore,
+    actualPct: remainingPct,
+    absoluteErrorPct,
+    tokensPerPctAfter: Math.round(learnedTokensPerPct ?? defaultTpp),
+    learnedUpdated,
+  });
+  if (state.calibrationHistory.length > 50) {
+    state.calibrationHistory = state.calibrationHistory.slice(-50);
+  }
+
   return {
     anchor,
     learnedUpdated,
     previousTokensPerPct: Math.round(previousTokensPerPct),
     newTokensPerPct: Math.round(learnedTokensPerPct ?? defaultTpp),
+    predictedPctBefore,
+    absoluteErrorPct,
   };
 }
 
@@ -784,6 +892,7 @@ export function buildUsageSnapshot(
 ): UsageSnapshot {
   const { config } = state;
   const cacheW = config.weights.cacheReadWeight;
+  const pricing = config.pricing ?? DEFAULT_PRICING;
   const todayStartMs = getTodayStartMs(nowMs);
   const shortCutoff = nowMs - getWindowDurationMs(config, 'short');
   const weeklyCutoff = nowMs - getWindowDurationMs(config, 'weekly');
@@ -807,9 +916,9 @@ export function buildUsageSnapshot(
       models: Array.from(modelsSet).sort(),
       shortWindow: shortRes.forecast,
       weeklyWindow: weeklyRes.forecast,
-      shortTokens: aggregateTokens(shortRes.windowEvents, cacheW),
-      weeklyTokens: aggregateTokens(weeklyRes.windowEvents, cacheW),
-      allTimeTokens: aggregateTokens(poolEvents, cacheW),
+      shortTokens: aggregateTokens(shortRes.windowEvents, cacheW, pricing),
+      weeklyTokens: aggregateTokens(weeklyRes.windowEvents, cacheW, pricing),
+      allTimeTokens: aggregateTokens(poolEvents, cacheW, pricing),
       burnRate: shortRes.burnRate,
       calibration: shortCal && shortCal.nextResetAtMs > nowMs ? shortCal : undefined,
       weeklyCalibration: weeklyCal && weeklyCal.nextResetAtMs > nowMs ? weeklyCal : undefined,
@@ -830,20 +939,24 @@ export function buildUsageSnapshot(
     })[0];
   }
 
-  const allTime = aggregateTokens(events, cacheW);
+  const allTime = aggregateTokens(events, cacheW, pricing);
   const today = aggregateTokens(
     events.filter((e) => e.timestampMs >= todayStartMs && e.timestampMs <= nowMs),
     cacheW,
+    pricing,
   );
   const shortWindowTotals = aggregateTokens(
     events.filter((e) => e.timestampMs >= shortCutoff && e.timestampMs <= nowMs),
     cacheW,
+    pricing,
   );
   const weeklyWindowTotals = aggregateTokens(
     events.filter((e) => e.timestampMs >= weeklyCutoff && e.timestampMs <= nowMs),
     cacheW,
+    pricing,
   );
 
+  // Per-model breakdown
   const byModel = new Map<string, UsageEvent[]>();
   for (const ev of events) {
     const arr = byModel.get(ev.model);
@@ -852,7 +965,7 @@ export function buildUsageSnapshot(
   }
   const models: ModelBreakdownSummary[] = Array.from(byModel.entries())
     .map(([model, modelEvents]) => {
-      const tokens = aggregateTokens(modelEvents, cacheW);
+      const tokens = aggregateTokens(modelEvents, cacheW, pricing);
       return {
         model,
         poolId: modelEvents[0].poolId,
@@ -863,6 +976,7 @@ export function buildUsageSnapshot(
     })
     .sort((a, b) => b.tokens.totalTokens - a.tokens.totalTokens);
 
+  // Per-conversation breakdown (with peakContextTokens & context bloat detection)
   const byConv = new Map<string, UsageEvent[]>();
   for (const ev of events) {
     const arr = byConv.get(ev.conversationId);
@@ -872,16 +986,61 @@ export function buildUsageSnapshot(
   const conversations: ConversationSummary[] = Array.from(byConv.entries())
     .map(([conversationId, convEvents]) => {
       const meta = conversationsMap.get(conversationId);
-      const tokens = aggregateTokens(convEvents, cacheW);
-      const lastActiveMs = convEvents[convEvents.length - 1]?.timestampMs ?? meta?.lastTimestampMs ?? nowMs;
+      const tokens = aggregateTokens(convEvents, cacheW, pricing);
+      const lastActiveMs =
+        convEvents[convEvents.length - 1]?.timestampMs ?? meta?.lastTimestampMs ?? nowMs;
       const modelSet = new Set(convEvents.map((e) => e.model));
+      let peakContextTokens = 0;
+      for (const ev of convEvents) {
+        const ctx = ev.inputTokens + ev.cacheReadTokens;
+        if (ctx > peakContextTokens) peakContextTokens = ctx;
+      }
+      const avgTokensPerTurn =
+        tokens.turns > 0 ? Math.round(tokens.totalTokens / tokens.turns) : 0;
+
       return {
         conversationId,
         title: meta?.title || `Session ${conversationId.slice(0, 8)}`,
+        projectName: meta?.projectName || 'Default Workspace',
         surface: meta?.surface ?? convEvents[0].surface,
         models: Array.from(modelSet),
         lastActiveAt: new Date(lastActiveMs).toISOString(),
         lastActiveMs,
+        tokens,
+        peakContextTokens,
+        avgTokensPerTurn,
+        contextBloatRisk: peakContextTokens >= CONTEXT_BLOAT_THRESHOLD,
+        shareOfAllTimePct:
+          allTime.totalTokens > 0 ? round1((tokens.totalTokens / allTime.totalTokens) * 100) : 0,
+      };
+    })
+    .sort((a, b) => b.tokens.totalTokens - a.tokens.totalTokens);
+
+  // Per-project aggregation
+  const byProjectEvents = new Map<string, UsageEvent[]>();
+  const byProjectConvCount = new Map<string, number>();
+  for (const conv of conversations) {
+    byProjectConvCount.set(conv.projectName, (byProjectConvCount.get(conv.projectName) ?? 0) + 1);
+  }
+  for (const ev of events) {
+    const projectName = conversationsMap.get(ev.conversationId)?.projectName || 'Default Workspace';
+    const arr = byProjectEvents.get(projectName);
+    if (arr) arr.push(ev);
+    else byProjectEvents.set(projectName, [ev]);
+  }
+  const projects: ProjectUsageSummary[] = Array.from(byProjectEvents.entries())
+    .map(([projectName, projEvents]) => {
+      const tokens = aggregateTokens(projEvents, cacheW, pricing);
+      const modelTokens = new Map<string, number>();
+      for (const ev of projEvents) {
+        modelTokens.set(ev.model, (modelTokens.get(ev.model) ?? 0) + ev.totalTokens);
+      }
+      const topModel =
+        Array.from(modelTokens.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? 'unknown';
+      return {
+        projectName,
+        conversationCount: byProjectConvCount.get(projectName) ?? 1,
+        topModel,
         tokens,
         shareOfAllTimePct:
           allTime.totalTokens > 0 ? round1((tokens.totalTokens / allTime.totalTokens) * 100) : 0,
@@ -889,6 +1048,7 @@ export function buildUsageSnapshot(
     })
     .sort((a, b) => b.tokens.totalTokens - a.tokens.totalTokens);
 
+  // Per-tool breakdown
   const toolCounts = new Map<string, number>();
   let totalToolCalls = 0;
   for (const ev of events) {
@@ -907,8 +1067,9 @@ export function buildUsageSnapshot(
     .slice(0, 15);
 
   const hourlyTrend24h = buildHourlyTrend24h(events, nowMs);
-  const dailyTrend7d = buildDailyTrend7d(events, nowMs);
-  const recommendations = buildSmartRecommendations(pools, primaryPool, allTime);
+  const dailyTrend7d = buildDailyTrend7d(events, nowMs, config);
+  const calibrationAccuracy = buildCalibrationAccuracy(state.calibrationHistory ?? []);
+  const recommendations = buildSmartRecommendations(pools, primaryPool, allTime, conversations);
 
   return {
     generatedAtMs: nowMs,
@@ -925,10 +1086,12 @@ export function buildUsageSnapshot(
     },
     pools,
     models,
+    projects,
     conversations,
     topTools,
     hourlyTrend24h,
     dailyTrend7d,
+    calibrationAccuracy,
     recommendations,
     scannedFilesCount,
     totalEventsCount: events.length,

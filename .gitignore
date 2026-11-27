@@ -4,3 +4,13 @@ coverage/
 .DS_Store
 *.log
 *.tmp
+
+# Local runtime state, transcripts & secrets (never commit)
+.env
+.env.*
+state.json
+transcript.jsonl
+transcript_full.jsonl
+*.pem
+*.key
+.gemini/

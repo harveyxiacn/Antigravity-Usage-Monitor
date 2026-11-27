@@ -1,4 +1,5 @@
 import {
+  calibrationKey,
   loadState,
   mergeConfig,
   saveState,
@@ -8,7 +9,7 @@ import {
   buildUsageSnapshot,
 } from './engine.js';
 import {
-  fetchConversationTitlesFromService,
+  fetchConversationMetadataFromService,
   scanTranscripts,
   type BrainRoot,
 } from './scanner.js';
@@ -19,13 +20,14 @@ import type {
   UsageSnapshot,
   WindowKind,
 } from './types.js';
-import { calibrationKey } from './config.js';
 
 export * from './types.js';
 export * from './config.js';
 export * from './scanner.js';
 export * from './engine.js';
 export * from './report.js';
+export * from './simulator.js';
+export * from './notifier.js';
 
 export interface CollectOptions {
   dataDir?: string;
@@ -41,11 +43,13 @@ export async function collectUsageSnapshot(options: CollectOptions = {}): Promis
   const scan = scanTranscripts(state.config, state.scanCache, options.overrideRoots);
 
   if (options.enrichTitles !== false) {
-    const remoteTitles = await fetchConversationTitlesFromService();
-    for (const [id, title] of remoteTitles.entries()) {
+    const remoteMeta = await fetchConversationMetadataFromService();
+    for (const [id, info] of remoteMeta.entries()) {
       const meta = scan.conversations.get(id);
-      if (meta) {
-        meta.title = title;
+      if (!meta) continue;
+      if (info.title) meta.title = info.title;
+      if (info.projectId && meta.projectName === 'Default Workspace') {
+        meta.projectName = info.projectId;
       }
     }
   }
@@ -76,6 +80,8 @@ export async function calibrateAndSnapshot(
   learnedUpdated: boolean;
   previousTokensPerPct: number;
   newTokensPerPct: number;
+  predictedPctBefore: number;
+  absoluteErrorPct: number;
 }> {
   const nowMs = options.nowMs ?? Date.now();
   const state = loadState(options.dataDir);
@@ -98,6 +104,8 @@ export async function calibrateAndSnapshot(
     learnedUpdated: calResult.learnedUpdated,
     previousTokensPerPct: calResult.previousTokensPerPct,
     newTokensPerPct: calResult.newTokensPerPct,
+    predictedPctBefore: calResult.predictedPctBefore,
+    absoluteErrorPct: calResult.absoluteErrorPct,
   };
 }
 

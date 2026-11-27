@@ -23,6 +23,11 @@ export interface ScanResult {
   cache: Record<string, CachedTranscriptFile>;
 }
 
+export interface RemoteConversationInfo {
+  title?: string;
+  projectId?: string;
+}
+
 export function getDefaultBrainRoots(customBrainDirs: string[] = []): BrainRoot[] {
   const home = os.homedir();
   const geminiRoot = path.join(home, '.gemini');
@@ -93,6 +98,53 @@ export function extractUserTitle(rawContent: string): string {
   return text.length > 64 ? `${text.slice(0, 61)}...` : text;
 }
 
+/**
+ * Heuristically infers a workspace/project folder name from file paths referenced by tool calls.
+ * Ignores ~/.gemini internal paths and temporary directories.
+ */
+export function inferProjectNameFromPath(rawPath: string): string | undefined {
+  if (!rawPath) return undefined;
+  const cleaned = rawPath.replace(/^"+|"+$/g, '').replace(/\\/g, '/').trim();
+  if (!cleaned) return undefined;
+  const lower = cleaned.toLowerCase();
+  if (lower.includes('/.gemini/') || lower.includes('/appdata/') || lower.includes('/temp/') || lower.startsWith('/tmp/')) {
+    return undefined;
+  }
+
+  // Common project parent directory names (Projects, Project, workspace, workspaces, repos, src, code, dev, git)
+  const parts = cleaned.split('/').filter(Boolean);
+  const parentMarkers = new Set([
+    'project',
+    'projects',
+    'workspace',
+    'workspaces',
+    'repo',
+    'repos',
+    'code',
+    'dev',
+    'work',
+    'github',
+    'git',
+  ]);
+  for (let i = 0; i < parts.length - 1; i++) {
+    if (parentMarkers.has(parts[i].toLowerCase())) {
+      const candidate = parts[i + 1];
+      if (candidate && !candidate.includes('.')) {
+        return candidate;
+      }
+    }
+  }
+
+  // Fallback for Unix /Users/<user>/<repo>/... or Windows <drive>:/<repo>/...
+  if (parts.length >= 2 && /^[a-z]:$/i.test(parts[0])) {
+    const candidate = parts[1];
+    if (candidate && !['users', 'windows', 'program files', 'program files (x86)'].includes(candidate.toLowerCase())) {
+      return candidate;
+    }
+  }
+  return undefined;
+}
+
 function toNumber(v: unknown): number {
   if (typeof v === 'number' && Number.isFinite(v) && v >= 0) {
     return v;
@@ -122,7 +174,7 @@ function parseTranscriptLine(
   surface: SurfaceName,
   fallbackMs: number,
   config: MonitorConfig,
-): { event?: UsageEvent; userTitle?: string; timestampMs?: number } {
+): { event?: UsageEvent; userTitle?: string; inferredProject?: string; timestampMs?: number } {
   let obj: Record<string, unknown>;
   try {
     obj = JSON.parse(line) as Record<string, unknown>;
@@ -171,22 +223,39 @@ function parseTranscriptLine(
   );
 
   const toolNames: string[] = [];
+  let inferredProject: string | undefined;
+
   if (Array.isArray(obj.tool_calls)) {
     for (const tc of obj.tool_calls) {
-      if (tc && typeof tc === 'object' && typeof (tc as Record<string, unknown>).name === 'string') {
-        toolNames.push((tc as Record<string, unknown>).name as string);
+      if (!tc || typeof tc !== 'object') continue;
+      const tcRec = tc as Record<string, unknown>;
+      if (typeof tcRec.name === 'string') {
+        toolNames.push(tcRec.name);
+      }
+      if (!inferredProject && tcRec.args && typeof tcRec.args === 'object') {
+        const argsRec = tcRec.args as Record<string, unknown>;
+        for (const key of ['Path', 'path', 'Cwd', 'cwd', 'Directory', 'TargetFile']) {
+          if (typeof argsRec[key] === 'string') {
+            const p = inferProjectNameFromPath(argsRec[key] as string);
+            if (p) {
+              inferredProject = p;
+              break;
+            }
+          }
+        }
       }
     }
   }
 
   if (totalTokens === 0 && toolNames.length === 0) {
-    return { timestampMs: ts.ms };
+    return { timestampMs: ts.ms, inferredProject };
   }
 
   const stepIndex = toNumber(obj.step_index ?? obj.stepIndex);
 
   return {
     timestampMs: ts.ms,
+    inferredProject,
     event: {
       conversationId,
       surface,
@@ -219,10 +288,8 @@ function readNewLines(
   try {
     const bytesRead = fs.readSync(fd, buffer, 0, bytesToRead, startOffset);
     const slice = buffer.subarray(0, bytesRead);
-    const lastNewlineIdx = slice.lastIndexOf(0x0a); // '\n'
+    const lastNewlineIdx = slice.lastIndexOf(0x0a);
 
-    // If the file doesn't end with a newline, try parsing the tail only if valid JSON,
-    // otherwise keep byteOffset at last newline so we don't split an in-progress write.
     let consumedBytes = bytesRead;
     let textToParse = slice.toString('utf8');
 
@@ -243,9 +310,7 @@ function readNewLines(
     if (tail.length > 0) {
       try {
         JSON.parse(tail);
-        // tail is complete valid JSON
       } catch {
-        // incomplete trailing write — stop at last newline
         consumedBytes = lastNewlineIdx + 1;
         textToParse = slice.subarray(0, consumedBytes).toString('utf8');
       }
@@ -292,9 +357,9 @@ export function scanTranscripts(
       cached &&
       cached.mtimeMs === stat.mtimeMs &&
       cached.size === stat.size &&
-      cached.byteOffset <= stat.size
+      cached.byteOffset <= stat.size &&
+      typeof cached.projectName === 'string'
     ) {
-      // Recompute weightedTokens in case config weights changed
       entry = {
         ...cached,
         events: cached.events.map((ev) => ({
@@ -311,7 +376,11 @@ export function scanTranscripts(
       };
     } else {
       updatedFilesCount += 1;
-      const canAppend = cached && stat.size >= cached.byteOffset && cached.byteOffset > 0;
+      const canAppend =
+        cached &&
+        stat.size >= cached.byteOffset &&
+        cached.byteOffset > 0 &&
+        typeof cached.projectName === 'string';
       const startOffset = canAppend ? cached.byteOffset : 0;
       const baseEvents = canAppend
         ? cached.events.map((ev) => ({
@@ -327,6 +396,7 @@ export function scanTranscripts(
           }))
         : [];
       let title = canAppend ? cached.title : '';
+      let projectName = canAppend ? cached.projectName : '';
       let firstTimestampMs = canAppend ? cached.firstTimestampMs : Number.POSITIVE_INFINITY;
       let lastTimestampMs = canAppend ? cached.lastTimestampMs : 0;
 
@@ -346,6 +416,9 @@ export function scanTranscripts(
         if (!title && parsed.userTitle) {
           title = parsed.userTitle;
         }
+        if ((!projectName || projectName === 'Default Workspace') && parsed.inferredProject) {
+          projectName = parsed.inferredProject;
+        }
         if (parsed.event) {
           baseEvents.push(parsed.event);
         }
@@ -362,6 +435,7 @@ export function scanTranscripts(
         size: stat.size,
         byteOffset: nextOffset,
         title: title || `Session ${item.conversationId.slice(0, 8)}`,
+        projectName: projectName || 'Default Workspace',
         firstTimestampMs,
         lastTimestampMs,
         events: baseEvents,
@@ -376,6 +450,7 @@ export function scanTranscripts(
       conversationId: entry.conversationId,
       surface: entry.surface,
       title: entry.title,
+      projectName: entry.projectName,
       firstTimestampMs: entry.firstTimestampMs,
       lastTimestampMs: entry.lastTimestampMs,
       transcriptPath: entry.transcriptPath,
@@ -394,15 +469,16 @@ export function scanTranscripts(
 }
 
 /**
- * Optionally enriches conversation titles using the documented Antigravity ConversationService API.
- * Never throws; returns empty map if env vars are absent or service is unreachable.
+ * Optionally enriches conversation titles and projectIds via the official ConversationService API.
  */
-export async function fetchConversationTitlesFromService(): Promise<Map<string, string>> {
-  const titles = new Map<string, string>();
+export async function fetchConversationMetadataFromService(): Promise<
+  Map<string, RemoteConversationInfo>
+> {
+  const infoMap = new Map<string, RemoteConversationInfo>();
   const lsAddress = process.env.ANTIGRAVITY_LS_ADDRESS;
   const csrfToken = process.env.ANTIGRAVITY_CSRF_TOKEN;
   if (!lsAddress || !csrfToken) {
-    return titles;
+    return infoMap;
   }
 
   const controller = new AbortController();
@@ -421,10 +497,11 @@ export async function fetchConversationTitlesFromService(): Promise<Map<string, 
         signal: controller.signal,
       },
     );
-    if (!res.ok) return titles;
+    if (!res.ok) return infoMap;
     const data = (await res.json()) as {
       conversations?: Array<{
         id?: string;
+        metadata?: { projectId?: string };
         annotations?: { title?: string };
         state?: { summary?: string };
       }>;
@@ -432,14 +509,15 @@ export async function fetchConversationTitlesFromService(): Promise<Map<string, 
     for (const conv of data.conversations ?? []) {
       if (!conv.id) continue;
       const title = conv.annotations?.title?.trim() || conv.state?.summary?.trim();
-      if (title) {
-        titles.set(conv.id, title);
+      const projectId = conv.metadata?.projectId?.trim();
+      if (title || projectId) {
+        infoMap.set(conv.id, { title, projectId });
       }
     }
   } catch {
-    // Silent fallback to transcript titles
+    // Silent fallback
   } finally {
     clearTimeout(timeout);
   }
-  return titles;
+  return infoMap;
 }

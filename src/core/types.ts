@@ -24,11 +24,18 @@ export interface PoolBudgets {
   weeklyWeightedTokens: number;
 }
 
+export interface PoolPricingUsdPer1M {
+  inputPer1M: number;
+  cacheReadPer1M: number;
+  outputPer1M: number;
+}
+
 export interface AlertConfig {
   enabled: boolean;
   warningRemainingPct: number;
   criticalRemainingPct: number;
   cooldownMinutes: number;
+  desktopNotification: boolean;
 }
 
 export interface MonitorConfig {
@@ -40,10 +47,11 @@ export interface MonitorConfig {
   bucketMinutes: number;
   recentMinutes: number;
   idleDecayHalfLifeMinutes: number;
-  /** Prior active duty cycle (0.1 - 1.0) used to regularize cold-start bursts (<45m elapsed). */
+  /** Prior active duty cycle (0.15 - 1.0) used to regularize cold-start bursts. */
   dutyCyclePrior: number;
   weights: TokenWeights;
   poolBudgets: Record<PoolId, PoolBudgets>;
+  pricing: Record<PoolId, PoolPricingUsdPer1M>;
   alerts: AlertConfig;
   customBrainDirs: string[];
 }
@@ -68,9 +76,16 @@ export interface ConversationMeta {
   conversationId: string;
   surface: SurfaceName;
   title: string;
+  projectName: string;
   firstTimestampMs: number;
   lastTimestampMs: number;
   transcriptPath: string;
+}
+
+export interface CostBreakdown {
+  estimatedApiCostUsd: number;
+  withoutCacheCostUsd: number;
+  cacheSavingsUsd: number;
 }
 
 export interface TokenTotals {
@@ -83,6 +98,7 @@ export interface TokenTotals {
   savedByCacheTokens: number;
   turns: number;
   toolCalls: number;
+  cost: CostBreakdown;
 }
 
 export interface CalibrationAnchor {
@@ -94,6 +110,24 @@ export interface CalibrationAnchor {
   cumulativeWeightedAtCalibration: number;
   learnedTokensPerPct?: number;
   sampleCount: number;
+}
+
+export interface CalibrationHistoryEntry {
+  timestampMs: number;
+  timestampIso: string;
+  poolId: PoolId;
+  windowKind: WindowKind;
+  predictedPctBefore: number;
+  actualPct: number;
+  absoluteErrorPct: number;
+  tokensPerPctAfter: number;
+  learnedUpdated: boolean;
+}
+
+export interface CalibrationAccuracySummary {
+  totalCalibrations: number;
+  meanAbsoluteErrorPct: number | null;
+  recentRecords: CalibrationHistoryEntry[];
 }
 
 export interface CalibrationInput {
@@ -113,7 +147,6 @@ export interface BurnRateEstimate {
   /** Unregularized continuous full-throttle coding rate. */
   rawActivePctPerHour: number;
   decayFactor: number;
-  /** Effective duty cycle applied (0.15 - 1.0). */
   effectiveDutyCycle: number;
   observedDutyCycle: number;
   stdDevPctPerHour: number;
@@ -181,6 +214,7 @@ export interface DailyBucket {
   cacheHitRate: number;
   turns: number;
   toolCalls: number;
+  estimatedApiCostUsd: number;
 }
 
 export interface SmartRecommendation {
@@ -208,10 +242,22 @@ export interface PoolSnapshot {
 export interface ConversationSummary {
   conversationId: string;
   title: string;
+  projectName: string;
   surface: SurfaceName;
   models: string[];
   lastActiveAt: string;
   lastActiveMs: number;
+  tokens: TokenTotals;
+  peakContextTokens: number;
+  avgTokensPerTurn: number;
+  contextBloatRisk: boolean;
+  shareOfAllTimePct: number;
+}
+
+export interface ProjectUsageSummary {
+  projectName: string;
+  conversationCount: number;
+  topModel: string;
   tokens: TokenTotals;
   shareOfAllTimePct: number;
 }
@@ -229,6 +275,31 @@ export interface ModelBreakdownSummary {
   shareOfAllTimePct: number;
 }
 
+export interface SimulationInput {
+  poolId?: PoolId;
+  windowKind?: WindowKind;
+  additionalTurns?: number;
+  additionalMinutes?: number;
+  avgWeightedTokensPerTurn?: number;
+  /** Fraction (0 - 100) of planned workload offloaded to gemini-flash. */
+  offloadToFlashPct?: number;
+}
+
+export interface SimulationResult {
+  poolId: PoolId;
+  windowKind: WindowKind;
+  baselineRemainingPct: number;
+  simulatedAddedWeightedTokens: number;
+  simulatedAddedPct: number;
+  remainingAfterWorkloadPct: number;
+  survivesUntilReset: boolean;
+  offloadToFlashPct: number;
+  withOffloadRemainingPct: number;
+  flashImpactPct: number;
+  savedPrimaryPct: number;
+  recommendation: string;
+}
+
 export interface UsageSnapshot {
   generatedAtMs: number;
   generatedAtIso: string;
@@ -244,10 +315,12 @@ export interface UsageSnapshot {
   };
   pools: PoolSnapshot[];
   models: ModelBreakdownSummary[];
+  projects: ProjectUsageSummary[];
   conversations: ConversationSummary[];
   topTools: ToolUsageSummary[];
   hourlyTrend24h: HourlyBucket[];
   dailyTrend7d: DailyBucket[];
+  calibrationAccuracy: CalibrationAccuracySummary;
   recommendations: SmartRecommendation[];
   scannedFilesCount: number;
   totalEventsCount: number;
@@ -262,6 +335,7 @@ export interface CachedTranscriptFile {
   size: number;
   byteOffset: number;
   title: string;
+  projectName: string;
   firstTimestampMs: number;
   lastTimestampMs: number;
   events: UsageEvent[];
@@ -271,6 +345,7 @@ export interface PersistentState {
   version: number;
   config: MonitorConfig;
   calibrations: Record<string, CalibrationAnchor>;
+  calibrationHistory: CalibrationHistoryEntry[];
   scanCache: Record<string, CachedTranscriptFile>;
   lastAlertAtMs: Record<string, number>;
 }

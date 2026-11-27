@@ -4,6 +4,7 @@ import {
   loadState,
   saveState,
   scanTranscripts,
+  sendDesktopNotification,
   type BrainRoot,
   type ForecastResult,
   type UsageSnapshot,
@@ -47,7 +48,7 @@ function buildAlertMarkdown(snapshot: UsageSnapshot, forecast: ForecastResult): 
   return [
     `> ${icon} **Antigravity 额度预警 (${pool.displayName})**`,
     `> 当前余量 **${forecast.currentRemainingPct.toFixed(1)}%** · 距下次刷新约 **${formatMins(resetMins)}** · ${lockoutNote}`,
-    `> 本窗口累计消耗 **${snapshot.totals.shortWindow.totalTokens.toLocaleString()}** tokens（缓存命中 ${snapshot.totals.shortWindow.cacheHitRate.toFixed(1)}%）· 建议将节奏控制在 ≤ **${forecast.safeBurnRatePctPerHour.toFixed(1)}%/h** 或临时切至 Flash 模型。`,
+    `> 本窗口累计消耗 **${snapshot.totals.shortWindow.totalTokens.toLocaleString()}** tokens（缓存命中 ${snapshot.totals.shortWindow.cacheHitRate.toFixed(1)}%，等效 API 省下 $${snapshot.totals.shortWindow.cost.cacheSavingsUsd.toFixed(2)}）· 建议将节奏控制在 ≤ **${forecast.safeBurnRatePctPerHour.toFixed(1)}%/h** 或临时切至 Flash 模型。`,
   ].join('\n');
 }
 
@@ -57,6 +58,7 @@ export function evaluatePostInvocationHook(
     dataDir?: string;
     nowMs?: number;
     overrideRoots?: BrainRoot[];
+    enableDesktopNotify?: boolean;
   } = {},
 ): HookOutput {
   const nowMs = options.nowMs ?? Date.now();
@@ -115,6 +117,14 @@ export function evaluatePostInvocationHook(
     saveState(state, options.dataDir);
   } catch {
     // ignore read-only cache persistence failure
+  }
+
+  if (options.enableDesktopNotify !== false && state.config.alerts.desktopNotification) {
+    const pool = snapshot.pools.find((p) => p.poolId === snapshot.primaryPoolId) ?? snapshot.pools[0];
+    sendDesktopNotification({
+      title: `Antigravity 额度预警 (${pool.displayName})`,
+      message: `当前剩余 ${forecast.currentRemainingPct.toFixed(1)}%，下次刷新预计剩余 ${forecast.predictedRemainingPctAtReset.toFixed(1)}%，建议降至 <= ${forecast.safeBurnRatePctPerHour.toFixed(1)}%/h`,
+    });
   }
 
   return {

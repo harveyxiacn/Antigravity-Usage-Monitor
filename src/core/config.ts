@@ -7,10 +7,11 @@ import type {
   PlanId,
   PoolBudgets,
   PoolId,
+  PoolPricingUsdPer1M,
   TokenWeights,
 } from './types.js';
 
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
 
 export const POOL_DISPLAY_NAMES: Record<PoolId, string> = {
   'gemini-pro': 'Gemini Pro / Neon',
@@ -28,6 +29,24 @@ export const DEFAULT_WEIGHTS: TokenWeights = {
     'gemini-pro': 1.0,
     'gemini-flash': 0.25,
     partner: 1.25,
+  },
+};
+
+export const DEFAULT_PRICING: Record<PoolId, PoolPricingUsdPer1M> = {
+  'gemini-pro': {
+    inputPer1M: 1.25,
+    cacheReadPer1M: 0.125,
+    outputPer1M: 10.0,
+  },
+  'gemini-flash': {
+    inputPer1M: 0.15,
+    cacheReadPer1M: 0.015,
+    outputPer1M: 0.6,
+  },
+  partner: {
+    inputPer1M: 3.0,
+    cacheReadPer1M: 0.3,
+    outputPer1M: 15.0,
   },
 };
 
@@ -100,11 +119,21 @@ export function clonePoolBudgets(
   };
 }
 
+export function clonePricing(
+  pricing: Record<PoolId, PoolPricingUsdPer1M>,
+): Record<PoolId, PoolPricingUsdPer1M> {
+  return {
+    'gemini-pro': { ...pricing['gemini-pro'] },
+    'gemini-flash': { ...pricing['gemini-flash'] },
+    partner: { ...pricing.partner },
+  };
+}
+
 export function createDefaultConfig(plan: PlanId = 'ai-pro'): MonitorConfig {
   return {
     plan,
-    shortWindowMinutes: 300, // 5 hours
-    weeklyWindowHours: 168, // 7 days
+    shortWindowMinutes: 300,
+    weeklyWindowHours: 168,
     safetyBufferPct: 5,
     ewmaAlpha: 0.35,
     bucketMinutes: 5,
@@ -116,11 +145,13 @@ export function createDefaultConfig(plan: PlanId = 'ai-pro'): MonitorConfig {
       poolMultipliers: { ...DEFAULT_WEIGHTS.poolMultipliers },
     },
     poolBudgets: clonePoolBudgets(PLAN_PRESETS[plan]),
+    pricing: clonePricing(DEFAULT_PRICING),
     alerts: {
       enabled: true,
       warningRemainingPct: 20,
       criticalRemainingPct: 10,
       cooldownMinutes: 15,
+      desktopNotification: true,
     },
     customBrainDirs: [],
   };
@@ -181,6 +212,7 @@ export function createDefaultState(): PersistentState {
     version: STATE_VERSION,
     config: createDefaultConfig('ai-pro'),
     calibrations: {},
+    calibrationHistory: [],
     scanCache: {},
     lastAlertAtMs: {},
   };
@@ -205,6 +237,17 @@ export function mergeConfig(
       }
     }
   }
+  const nextPricing = clonePricing(base.pricing ?? DEFAULT_PRICING);
+  if (patch.pricing) {
+    for (const poolId of ALL_POOLS) {
+      if (patch.pricing[poolId]) {
+        nextPricing[poolId] = {
+          ...nextPricing[poolId],
+          ...patch.pricing[poolId],
+        };
+      }
+    }
+  }
   return {
     ...base,
     ...patch,
@@ -223,6 +266,7 @@ export function mergeConfig(
           poolMultipliers: { ...base.weights.poolMultipliers },
         },
     poolBudgets: nextBudgets,
+    pricing: nextPricing,
     alerts: patch.alerts ? { ...base.alerts, ...patch.alerts } : { ...base.alerts },
     customBrainDirs: patch.customBrainDirs
       ? [...patch.customBrainDirs]
@@ -243,6 +287,9 @@ export function loadState(dataDir?: string): PersistentState {
       version: STATE_VERSION,
       config: parsed.config ? mergeConfig(defaults.config, parsed.config) : defaults.config,
       calibrations: parsed.calibrations ?? {},
+      calibrationHistory: Array.isArray(parsed.calibrationHistory)
+        ? parsed.calibrationHistory
+        : [],
       scanCache: parsed.scanCache ?? {},
       lastAlertAtMs: parsed.lastAlertAtMs ?? {},
     };
