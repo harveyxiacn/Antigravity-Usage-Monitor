@@ -1,0 +1,1061 @@
+import {
+  App,
+  applyDocumentTheme,
+  applyHostStyleVariables,
+} from '@modelcontextprotocol/ext-apps';
+import type {
+  ForecastResult,
+  HourlyBucket,
+  PlanId,
+  PoolId,
+  PoolSnapshot,
+  UsageSnapshot,
+  WindowKind,
+} from '../core/types.js';
+
+type ActiveTab = 'overview' | 'trends' | 'conversations' | 'models' | 'settings';
+
+const app = new App({ name: 'Antigravity Usage Monitor', version: '1.1.0' }, {});
+
+let snapshot: UsageSnapshot | null = null;
+let selectedPoolId: PoolId = 'gemini-pro';
+let selectedWindow: WindowKind = 'short';
+let activeTab: ActiveTab = 'overview';
+let autoRefresh = true;
+let isBusy = false;
+let statusNotice = '';
+let exportedReportText = '';
+let hostConnected = false;
+
+function formatNumber(n: number): string {
+  if (!Number.isFinite(n)) return '0';
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(Math.round(n));
+}
+
+function formatDurationMs(ms: number): string {
+  const clamped = Math.max(0, Math.floor(ms / 1000));
+  const days = Math.floor(clamped / 86400);
+  const hours = Math.floor((clamped % 86400) / 3600);
+  const mins = Math.floor((clamped % 3600) / 60);
+  const secs = clamped % 60;
+  if (days > 0) {
+    return `${days}d ${String(hours).padStart(2, '0')}h ${String(mins).padStart(2, '0')}m`;
+  }
+  return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+}
+
+function formatLocalTime(ms: number): string {
+  const d = new Date(ms);
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const now = new Date();
+  if (d.toDateString() === now.toDateString()) {
+    return `${hh}:${mm}`;
+  }
+  return `${month}-${day} ${hh}:${mm}`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function statusLabel(status: ForecastResult['status']): string {
+  switch (status) {
+    case 'healthy':
+      return '充裕健康';
+    case 'caution':
+      return '需留意节奏';
+    case 'warning':
+      return '预警 · 偏紧';
+    case 'critical':
+      return '高危 · 即将见底';
+    case 'exhausted':
+      return '已耗尽';
+  }
+}
+
+function statusColor(status: ForecastResult['status']): string {
+  switch (status) {
+    case 'healthy':
+      return 'var(--accent-success)';
+    case 'caution':
+    case 'warning':
+      return 'var(--accent-warning)';
+    case 'critical':
+    case 'exhausted':
+      return 'var(--accent-danger)';
+  }
+}
+
+function getSelectedPool(): PoolSnapshot | null {
+  if (!snapshot) return null;
+  return snapshot.pools.find((p) => p.poolId === selectedPoolId) ?? snapshot.pools[0] ?? null;
+}
+
+function renderGaugeSvg(forecast: ForecastResult): string {
+  const size = 168;
+  const cx = size / 2;
+  const cy = size / 2;
+  const rOuter = 68;
+  const rInner = 54;
+  const cOuter = 2 * Math.PI * rOuter;
+  const cInner = 2 * Math.PI * rInner;
+
+  const currentDash = (forecast.currentRemainingPct / 100) * cOuter;
+  const predDash = (forecast.predictedRemainingPctAtReset / 100) * cInner;
+  const color = statusColor(forecast.status);
+
+  return `
+    <svg class="gauge-svg" viewBox="0 0 ${size} ${size}" aria-label="额度余量仪表盘">
+      <circle cx="${cx}" cy="${cy}" r="${rOuter}" fill="none" stroke="var(--bg-tertiary)" stroke-width="10" />
+      <circle
+        cx="${cx}" cy="${cy}" r="${rOuter}"
+        fill="none"
+        stroke="var(--accent-info)"
+        stroke-width="10"
+        stroke-linecap="round"
+        stroke-dasharray="${currentDash.toFixed(1)} ${cOuter.toFixed(1)}"
+        transform="rotate(-90 ${cx} ${cy})"
+      />
+      <circle cx="${cx}" cy="${cy}" r="${rInner}" fill="none" stroke="var(--bg-tertiary)" stroke-width="7" opacity="0.7" />
+      <circle
+        cx="${cx}" cy="${cy}" r="${rInner}"
+        fill="none"
+        stroke="${color}"
+        stroke-width="7"
+        stroke-linecap="round"
+        stroke-dasharray="${predDash.toFixed(1)} ${cInner.toFixed(1)}"
+        transform="rotate(-90 ${cx} ${cy})"
+      />
+      <text x="${cx}" y="${cy - 8}" text-anchor="middle" fill="var(--text-primary)" font-size="22" font-weight="800" font-family="var(--font-mono)">
+        ${forecast.currentRemainingPct.toFixed(1)}%
+      </text>
+      <text x="${cx}" y="${cy + 11}" text-anchor="middle" fill="var(--text-secondary)" font-size="10">
+        当前剩余 (外环)
+      </text>
+      <text x="${cx}" y="${cy + 27}" text-anchor="middle" fill="${color}" font-size="11" font-weight="700" font-family="var(--font-mono)">
+        刷新剩 ${forecast.predictedRemainingPctAtReset.toFixed(1)}%
+      </text>
+    </svg>
+  `;
+}
+
+function renderTimelineSvg(pool: PoolSnapshot): string {
+  const pts = pool.timeline;
+  if (!pts || pts.length < 2) {
+    return '<p style="color:var(--text-secondary);font-size:12px;">暂无时间线样本。</p>';
+  }
+
+  const W = 680;
+  const H = 180;
+  const padL = 36;
+  const padR = 16;
+  const padT = 14;
+  const padB = 26;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  const minTs = pts[0].timestampMs;
+  const maxTs = Math.max(minTs + 60_000, pts[pts.length - 1].timestampMs);
+
+  const xOf = (ts: number) => padL + ((ts - minTs) / (maxTs - minTs)) * plotW;
+  const yOf = (pct: number) => padT + ((100 - Math.max(0, Math.min(100, pct))) / 100) * plotH;
+
+  const histPts = pts.filter((p) => !p.projected);
+  const projPts = pts.filter((p) => p.projected);
+  const lastHist = histPts[histPts.length - 1];
+
+  const histLine = histPts.map((p) => `${xOf(p.timestampMs).toFixed(1)},${yOf(p.remainingPct).toFixed(1)}`).join(' ');
+  const projChain = lastHist ? [lastHist, ...projPts] : projPts;
+  const projLine = projChain.map((p) => `${xOf(p.timestampMs).toFixed(1)},${yOf(p.remainingPct).toFixed(1)}`).join(' ');
+
+  let bandPoly = '';
+  if (projChain.length >= 2) {
+    const upper = projChain.map((p) => {
+      const v = p.optimisticPct ?? p.remainingPct;
+      return `${xOf(p.timestampMs).toFixed(1)},${yOf(v).toFixed(1)}`;
+    });
+    const lower = [...projChain].reverse().map((p) => {
+      const v = p.conservativePct ?? p.remainingPct;
+      return `${xOf(p.timestampMs).toFixed(1)},${yOf(v).toFixed(1)}`;
+    });
+    bandPoly = [...upper, ...lower].join(' ');
+  }
+
+  const nowX = lastHist ? xOf(lastHist.timestampMs) : padL;
+  const resetX = xOf(maxTs);
+  const warnY = yOf(snapshot?.config.alerts.warningRemainingPct ?? 20);
+  const fColor = statusColor(pool.shortWindow.status);
+
+  const yTicks = [100, 75, 50, 25, 0]
+    .map((pct) => {
+      const y = yOf(pct);
+      return `
+        <line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--border-secondary)" stroke-width="1" />
+        <text x="${padL - 6}" y="${(y + 3).toFixed(1)}" text-anchor="end" fill="var(--text-tertiary)" font-size="10" font-family="var(--font-mono)">${pct}%</text>
+      `;
+    })
+    .join('');
+
+  const xLabelIndices = [0, Math.floor(pts.length / 2), pts.length - 1];
+  const xLabels = xLabelIndices
+    .map((idx) => {
+      const p = pts[idx];
+      if (!p) return '';
+      return `<text x="${xOf(p.timestampMs).toFixed(1)}" y="${H - 6}" text-anchor="middle" fill="var(--text-tertiary)" font-size="10" font-family="var(--font-mono)">${escapeHtml(p.label)}</text>`;
+    })
+    .join('');
+
+  return `
+    <div class="chart-container">
+      <svg class="chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+        ${yTicks}
+        <line x1="${padL}" y1="${warnY.toFixed(1)}" x2="${W - padR}" y2="${warnY.toFixed(1)}" stroke="var(--accent-warning)" stroke-width="1" stroke-dasharray="3 3" opacity="0.6" />
+        ${bandPoly ? `<polygon points="${bandPoly}" fill="${fColor}" opacity="0.16" />` : ''}
+        ${histLine ? `<polyline fill="none" stroke="var(--accent-info)" stroke-width="2.5" points="${histLine}" />` : ''}
+        ${projLine ? `<polyline fill="none" stroke="${fColor}" stroke-width="2.2" stroke-dasharray="5 4" points="${projLine}" />` : ''}
+        <line x1="${nowX.toFixed(1)}" y1="${padT}" x2="${nowX.toFixed(1)}" y2="${H - padB}" stroke="var(--text-secondary)" stroke-width="1" stroke-dasharray="2 2" />
+        <text x="${(nowX + 4).toFixed(1)}" y="${padT + 10}" fill="var(--text-secondary)" font-size="10">现在</text>
+        <line x1="${resetX.toFixed(1)}" y1="${padT}" x2="${resetX.toFixed(1)}" y2="${H - padB}" stroke="var(--accent-success)" stroke-width="1.2" stroke-dasharray="3 2" />
+        <text x="${(resetX - 4).toFixed(1)}" y="${padT + 10}" text-anchor="end" fill="var(--accent-success)" font-size="10">下次刷新</text>
+        ${
+          lastHist
+            ? `<circle cx="${nowX.toFixed(1)}" cy="${yOf(lastHist.remainingPct).toFixed(1)}" r="4" fill="var(--accent-info)" />`
+            : ''
+        }
+        ${xLabels}
+      </svg>
+      <div class="chart-legend">
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--accent-info)"></span>历史余量轨迹</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:${fColor};border-top:2px dashed ${fColor}"></span>占空比融合预测</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:${fColor};opacity:0.35;height:8px"></span>P10–P90 预测置信带</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--accent-warning)"></span>预警线 (${snapshot?.config.alerts.warningRemainingPct ?? 20}%)</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderHourlyBarsSvg(buckets: HourlyBucket[]): string {
+  if (!buckets || buckets.length === 0) {
+    return '<p style="color:var(--text-secondary)">暂无 24 小时统计数据。</p>';
+  }
+  const maxTok = Math.max(1, ...buckets.map((b) => b.totalTokens));
+  const W = 680;
+  const H = 160;
+  const padL = 42;
+  const padR = 10;
+  const padT = 14;
+  const padB = 26;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+  const barSlot = plotW / buckets.length;
+  const barW = Math.max(6, barSlot - 6);
+
+  const bars = buckets
+    .map((b, i) => {
+      const x = padL + i * barSlot + (barSlot - barW) / 2;
+      const totalH = (b.totalTokens / maxTok) * plotH;
+      const cacheH = b.totalTokens > 0 ? (b.cacheReadTokens / b.totalTokens) * totalH : 0;
+      const freshAndOutH = Math.max(0, totalH - cacheH);
+      const yTop = padT + plotH - totalH;
+      const yCache = padT + plotH - cacheH;
+      const showLabel = i % 3 === 0 || i === buckets.length - 1;
+
+      return `
+        <g>
+          <title>${escapeHtml(b.label)} · 总计 ${formatNumber(b.totalTokens)} (Fresh ${formatNumber(b.inputTokens)} / Cache ${formatNumber(b.cacheReadTokens)} / Out ${formatNumber(b.outputTokens)} · ${b.turns}轮)</title>
+          ${freshAndOutH > 0 ? `<rect x="${x.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${freshAndOutH.toFixed(1)}" rx="2" fill="var(--accent-info)" />` : ''}
+          ${cacheH > 0 ? `<rect x="${x.toFixed(1)}" y="${yCache.toFixed(1)}" width="${barW.toFixed(1)}" height="${cacheH.toFixed(1)}" rx="2" fill="var(--accent-success)" opacity="0.85" />` : ''}
+          ${b.totalTokens === 0 ? `<rect x="${x.toFixed(1)}" y="${(padT + plotH - 2).toFixed(1)}" width="${barW.toFixed(1)}" height="2" fill="var(--border-secondary)" />` : ''}
+          ${showLabel ? `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 6}" text-anchor="middle" fill="var(--text-tertiary)" font-size="9.5" font-family="var(--font-mono)">${escapeHtml(b.label.slice(0, 2))}</text>` : ''}
+        </g>
+      `;
+    })
+    .join('');
+
+  return `
+    <div class="chart-container">
+      <svg class="chart-svg" style="height:160px" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+        <line x1="${padL}" y1="${padT}" x2="${W - padR}" y2="${padT}" stroke="var(--border-secondary)" stroke-width="1" />
+        <line x1="${padL}" y1="${padT + plotH / 2}" x2="${W - padR}" y2="${padT + plotH / 2}" stroke="var(--border-secondary)" stroke-width="1" stroke-dasharray="3 3" />
+        <line x1="${padL}" y1="${padT + plotH}" x2="${W - padR}" y2="${padT + plotH}" stroke="var(--border-primary)" stroke-width="1" />
+        <text x="${padL - 5}" y="${padT + 4}" text-anchor="end" fill="var(--text-tertiary)" font-size="9.5" font-family="var(--font-mono)">${formatNumber(maxTok)}</text>
+        <text x="${padL - 5}" y="${padT + plotH / 2 + 3}" text-anchor="end" fill="var(--text-tertiary)" font-size="9.5" font-family="var(--font-mono)">${formatNumber(maxTok / 2)}</text>
+        <text x="${padL - 5}" y="${padT + plotH + 3}" text-anchor="end" fill="var(--text-tertiary)" font-size="9.5" font-family="var(--font-mono)">0</text>
+        ${bars}
+      </svg>
+      <div class="chart-legend">
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--accent-info);height:8px"></span>Fresh Input + Output</span>
+        <span class="legend-item"><span class="legend-swatch" style="background:var(--accent-success);height:8px"></span>Prompt Cache Read (低权重)</span>
+      </div>
+    </div>
+  `;
+}
+
+function renderOverview(pool: PoolSnapshot, snap: UsageSnapshot): string {
+  const forecast = selectedWindow === 'short' ? pool.shortWindow : pool.weeklyWindow;
+  const remainingMs = Math.max(0, forecast.nextResetAtMs - Date.now());
+
+  const alertText =
+    forecast.projectedLockoutMinutes && forecast.projectedLockoutMinutes > 0
+      ? `按占空比融合速率 (${pool.burnRate.blendedPctPerHour}%/h)，预计 ${forecast.runwayMinutes} 分钟后耗尽，可能提前断档约 ${forecast.projectedLockoutMinutes} 分钟！建议控制在 ≤ ${forecast.safeBurnRatePctPerHour}%/h (${formatNumber(forecast.safeTokensPerMinute)} tok/min)。`
+      : `按占空比融合速率 (${pool.burnRate.blendedPctPerHour}%/h)，下次刷新时预计仍剩余 ${forecast.predictedRemainingPctAtReset.toFixed(1)}%（若不间断全速连跑则预计剩 ${forecast.activePacePredictedRemainingPct.toFixed(1)}%）。`;
+
+  const calBadge = forecast.calibrated
+    ? `<span class="badge info">已锚点校准 · 1%≈${formatNumber(forecast.tokensPerPct)} 加权Tok</span>`
+    : `<span class="badge">估算模式 (${snap.plan}) · 建议对照 /usage 校准</span>`;
+
+  const t = snap.totals;
+
+  return `
+    <div class="card">
+      <div class="card-title">
+        <span>${escapeHtml(pool.displayName)} · ${selectedWindow === 'short' ? '5 小时滚动短窗' : '7 天周度基线'} 刷新预告</span>
+        ${calBadge}
+      </div>
+      <div class="hero-grid">
+        <div class="gauge-wrap">
+          ${renderGaugeSvg(forecast)}
+          <span class="badge ${forecast.status}">${statusLabel(forecast.status)} · 置信度 ${forecast.confidence.toUpperCase()}</span>
+        </div>
+        <div class="hero-metrics">
+          <div class="forecast-headline">
+            <span style="color:var(--text-secondary);font-size:12px;">下次刷新时预告余下:</span>
+            <span class="forecast-big ${forecast.status}">${forecast.predictedRemainingPctAtReset.toFixed(1)}%</span>
+            <span class="badge">区间 ${forecast.predictedRange.conservative.toFixed(1)}% ~ ${forecast.predictedRange.optimistic.toFixed(1)}%</span>
+          </div>
+
+          <div class="sub-metrics">
+            <div class="mini-box">
+              <span class="mini-label">距下次刷新倒计时</span>
+              <span class="mini-value" id="countdown-clock">${formatDurationMs(remainingMs)}</span>
+              <span class="mini-sub">刷新时刻 ${formatLocalTime(forecast.nextResetAtMs)}</span>
+            </div>
+            <div class="mini-box">
+              <span class="mini-label">融合燃烧速率 (有效占空比 ${Math.round(pool.burnRate.effectiveDutyCycle * 100)}%)</span>
+              <span class="mini-value">${pool.burnRate.blendedPctPerHour.toFixed(2)}%/h</span>
+              <span class="mini-sub">全速活跃 ${pool.burnRate.rawActivePctPerHour.toFixed(1)}%/h · ${formatNumber(pool.burnRate.tokensPerMinute)} tok/m</span>
+            </div>
+            <div class="mini-box">
+              <span class="mini-label">全速连跑预告余量</span>
+              <span class="mini-value">${forecast.activePacePredictedRemainingPct.toFixed(1)}%</span>
+              <span class="mini-sub">100% 不间断编码极限参考</span>
+            </div>
+            <div class="mini-box">
+              <span class="mini-label">安全续航预算</span>
+              <span class="mini-value">${forecast.safeBurnRatePctPerHour.toFixed(1)}%/h</span>
+              <span class="mini-sub">保留 ${snap.config.safetyBufferPct}% 缓冲 (${formatNumber(forecast.safeTokensPerMinute)} tok/m)</span>
+            </div>
+          </div>
+
+          <div class="alert-banner ${forecast.status}">
+            <span>${escapeHtml(alertText)}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi-card">
+        <span class="kpi-label">累计总消耗 Tokens (All-Time)</span>
+        <span class="kpi-value">${formatNumber(t.allTime.totalTokens)}</span>
+        <span class="kpi-meta">${t.allTime.turns} 轮推理 · ${t.allTime.toolCalls} 次工具调用</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">当前 5h 窗口 Tokens</span>
+        <span class="kpi-value">${formatNumber(t.shortWindow.totalTokens)}</span>
+        <span class="kpi-meta">加权 ${formatNumber(t.shortWindow.weightedTokens)} · 今日 ${formatNumber(t.today.totalTokens)}</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Prompt 缓存命中率</span>
+        <span class="kpi-value">${t.allTime.cacheHitRate.toFixed(1)}%</span>
+        <span class="kpi-meta">缓存读取 ${formatNumber(t.allTime.cacheReadTokens)} · 节省 ${formatNumber(t.allTime.savedByCacheTokens)}</span>
+      </div>
+      <div class="kpi-card">
+        <span class="kpi-label">Fresh Input / Output</span>
+        <span class="kpi-value">${formatNumber(t.allTime.inputTokens)} / ${formatNumber(t.allTime.outputTokens)}</span>
+        <span class="kpi-meta">7天累计 ${formatNumber(t.weeklyWindow.totalTokens)} Tokens</span>
+      </div>
+    </div>
+
+    ${
+      snap.recommendations.length > 0
+        ? `
+      <div class="card">
+        <div class="card-title"><span>智能省额与节奏建议</span></div>
+        <div style="display:flex;flex-direction:column;gap:8px;">
+          ${snap.recommendations
+            .map(
+              (r) => `
+            <div class="alert-banner ${r.severity === 'critical' ? 'critical' : r.severity === 'warning' ? 'warning' : 'healthy'}" style="justify-content:flex-start;align-items:flex-start;flex-direction:column;gap:2px;">
+              <strong>${escapeHtml(r.title)}</strong>
+              <span style="opacity:0.92">${escapeHtml(r.detail)}</span>
+            </div>`,
+            )
+            .join('')}
+        </div>
+      </div>`
+        : ''
+    }
+
+    <div class="card">
+      <div class="card-title">
+        <span>额度消耗曲线与刷新余量预测轨迹 (${escapeHtml(pool.displayName)})</span>
+        <span style="font-weight:400;text-transform:none;">活跃 ${pool.burnRate.activeMinutesInWindow}m / 已过 ${pool.burnRate.elapsedMinutesInWindow}m · 静默 ${pool.burnRate.idleMinutesSinceLastEvent}m</span>
+      </div>
+      ${renderTimelineSvg(pool)}
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>全配额池状态对比</span>
+        <span style="font-weight:400;text-transform:none;">5h 短窗 vs 7d 周窗</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>模型池</th>
+              <th class="num">5h 当前余量</th>
+              <th class="num">5h 刷新预告</th>
+              <th class="num">7d 当前余量</th>
+              <th class="num">5h 消耗 Tokens</th>
+              <th class="num">缓存命中</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${snap.pools
+              .map(
+                (p) => `
+              <tr>
+                <td><strong>${escapeHtml(p.displayName)}</strong></td>
+                <td class="num">${p.shortWindow.currentRemainingPct.toFixed(1)}%</td>
+                <td class="num"><span class="badge ${p.shortWindow.status}">${p.shortWindow.predictedRemainingPctAtReset.toFixed(1)}%</span></td>
+                <td class="num">${p.weeklyWindow.currentRemainingPct.toFixed(1)}%</td>
+                <td class="num">${formatNumber(p.shortTokens.totalTokens)}</td>
+                <td class="num">${p.shortTokens.cacheHitRate.toFixed(1)}%</td>
+              </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>一键锚点校准 (对照 Antigravity 原生 /usage 或 Settings → Models)</span>
+        <span style="font-weight:400;text-transform:none;">同周期校准 2 次可自动学习 1% 额度对应 Token 系数</span>
+      </div>
+      <form id="cal-form" class="calibration-form">
+        <div class="field">
+          <label for="cal-pool">模型池</label>
+          <select id="cal-pool">
+            ${snap.pools
+              .map(
+                (p) =>
+                  `<option value="${p.poolId}" ${p.poolId === pool.poolId ? 'selected' : ''}>${escapeHtml(p.displayName)}</option>`,
+              )
+              .join('')}
+          </select>
+        </div>
+        <div class="field">
+          <label for="cal-window">窗口</label>
+          <select id="cal-window">
+            <option value="short" ${selectedWindow === 'short' ? 'selected' : ''}>5h 短窗</option>
+            <option value="weekly" ${selectedWindow === 'weekly' ? 'selected' : ''}>7d 周窗</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="cal-pct">当前剩余 (%)</label>
+          <input id="cal-pct" type="number" min="0" max="100" step="0.5" value="${forecast.currentRemainingPct.toFixed(1)}" required />
+        </div>
+        <div class="field">
+          <label for="cal-mins">距下次刷新 (分钟)</label>
+          <input id="cal-mins" type="number" min="1" max="20160" step="1" value="${Math.max(1, Math.round(remainingMs / 60000))}" required />
+        </div>
+        <button type="submit" class="btn primary" ${isBusy ? 'disabled' : ''}>保存校准</button>
+        <button type="button" id="cal-reset-btn" class="btn" ${isBusy ? 'disabled' : ''}>重置校准</button>
+      </form>
+    </div>
+  `;
+}
+
+function renderTrendsTab(snap: UsageSnapshot): string {
+  return `
+    <div class="card">
+      <div class="card-title">
+        <span>过去 24 小时 Token 消耗分布</span>
+        <span>悬停柱体查看各时段详细拆分</span>
+      </div>
+      ${renderHourlyBarsSvg(snap.hourlyTrend24h)}
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        <span>最近 7 天每日消耗趋势</span>
+        <div style="display:flex;gap:6px;">
+          <button type="button" id="btn-export-md" class="btn" ${isBusy ? 'disabled' : ''}>生成 Markdown 报告</button>
+          <button type="button" id="btn-export-csv" class="btn" ${isBusy ? 'disabled' : ''}>生成 CSV 表格</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th class="num">总 Tokens</th>
+              <th class="num">加权 Tokens</th>
+              <th class="num">缓存命中率</th>
+              <th class="num">推理轮次</th>
+              <th class="num">工具调用</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${snap.dailyTrend7d
+              .slice()
+              .reverse()
+              .map(
+                (d) => `
+              <tr>
+                <td><code>${escapeHtml(d.dateKey)}</code></td>
+                <td class="num"><strong>${formatNumber(d.totalTokens)}</strong></td>
+                <td class="num">${formatNumber(d.weightedTokens)}</td>
+                <td class="num">${d.cacheHitRate.toFixed(1)}%</td>
+                <td class="num">${d.turns}</td>
+                <td class="num">${d.toolCalls}</td>
+              </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    ${
+      exportedReportText
+        ? `
+      <div class="card">
+        <div class="card-title">
+          <span>导出报告预览</span>
+          <button type="button" id="btn-copy-report" class="btn primary">复制到剪贴板</button>
+        </div>
+        <textarea id="report-preview" readonly style="width:100%;min-height:180px;background:var(--bg-tertiary);color:var(--text-primary);border:1px solid var(--border-primary);border-radius:8px;padding:10px;font-family:var(--font-mono);font-size:11.5px;">${escapeHtml(exportedReportText)}</textarea>
+      </div>`
+        : ''
+    }
+  `;
+}
+
+function renderConversationsTab(snap: UsageSnapshot): string {
+  if (snap.conversations.length === 0) {
+    return '<div class="card"><p style="color:var(--text-secondary)">尚未扫描到包含 Token 记录的 Antigravity 会话。</p></div>';
+  }
+  return `
+    <div class="card">
+      <div class="card-title">
+        <span>会话 Token 消耗排行 (共 ${snap.conversations.length} 个会话)</span>
+        <span>来源文件 ${snap.scannedFilesCount} 个</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>会话标题</th>
+              <th>端</th>
+              <th class="num">总 Tokens</th>
+              <th class="num">Fresh In</th>
+              <th class="num">Cache Read</th>
+              <th class="num">Output</th>
+              <th class="num">命中率</th>
+              <th class="num">占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${snap.conversations
+              .slice(0, 30)
+              .map(
+                (c) => `
+              <tr>
+                <td class="truncate" title="${escapeHtml(c.title)}">${escapeHtml(c.title)}</td>
+                <td><span class="badge">${escapeHtml(c.surface)}</span></td>
+                <td class="num"><strong>${formatNumber(c.tokens.totalTokens)}</strong></td>
+                <td class="num">${formatNumber(c.tokens.inputTokens)}</td>
+                <td class="num">${formatNumber(c.tokens.cacheReadTokens)}</td>
+                <td class="num">${formatNumber(c.tokens.outputTokens)}</td>
+                <td class="num">${c.tokens.cacheHitRate.toFixed(1)}%</td>
+                <td class="num">${c.shareOfAllTimePct.toFixed(1)}%</td>
+              </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderModelsTab(snap: UsageSnapshot): string {
+  return `
+    <div class="card">
+      <div class="card-title"><span>分模型 Token 统计</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>模型 ID</th>
+              <th>所属池</th>
+              <th class="num">轮次</th>
+              <th class="num">总 Tokens</th>
+              <th class="num">加权 Tokens</th>
+              <th class="num">缓存命中</th>
+              <th class="num">占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${snap.models
+              .map(
+                (m) => `
+              <tr>
+                <td><code>${escapeHtml(m.model)}</code></td>
+                <td><span class="badge">${escapeHtml(m.poolId)}</span></td>
+                <td class="num">${m.tokens.turns}</td>
+                <td class="num"><strong>${formatNumber(m.tokens.totalTokens)}</strong></td>
+                <td class="num">${formatNumber(m.tokens.weightedTokens)}</td>
+                <td class="num">${m.tokens.cacheHitRate.toFixed(1)}%</td>
+                <td class="num">${m.shareOfAllTimePct.toFixed(1)}%</td>
+              </tr>`,
+              )
+              .join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title"><span>高频 Agent 工具调用 Top 15</span></div>
+      ${
+        snap.topTools.length === 0
+          ? '<p style="color:var(--text-secondary)">暂无工具调用记录。</p>'
+          : `<div style="display:flex;flex-direction:column;gap:8px;">
+              ${snap.topTools
+                .map(
+                  (t) => `
+                <div style="display:grid;grid-template-columns:160px 1fr 70px;gap:10px;align-items:center;">
+                  <code class="truncate">${escapeHtml(t.name)}</code>
+                  <div class="progress-track"><div class="progress-fill" style="width:${Math.min(100, t.sharePct)}%"></div></div>
+                  <span style="text-align:right;font-family:var(--font-mono);font-size:12px;">${t.calls} (${t.sharePct}%)</span>
+                </div>`,
+                )
+                .join('')}
+            </div>`
+      }
+    </div>
+  `;
+}
+
+function renderSettingsTab(snap: UsageSnapshot): string {
+  const cfg = snap.config;
+  return `
+    <div class="card">
+      <div class="card-title"><span>套餐预设、占空比与预警配置</span></div>
+      <form id="settings-form">
+        <div class="settings-grid">
+          <div class="field">
+            <label for="cfg-plan">Antigravity 订阅套餐</label>
+            <select id="cfg-plan">
+              <option value="free" ${cfg.plan === 'free' ? 'selected' : ''}>Free</option>
+              <option value="ai-pro" ${cfg.plan === 'ai-pro' ? 'selected' : ''}>Google AI Pro</option>
+              <option value="ai-ultra" ${cfg.plan === 'ai-ultra' ? 'selected' : ''}>Google AI Ultra</option>
+              <option value="custom" ${cfg.plan === 'custom' ? 'selected' : ''}>Custom 自定义</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="cfg-short-min">短窗口周期 (分钟)</label>
+            <input id="cfg-short-min" type="number" min="30" max="1440" value="${cfg.shortWindowMinutes}" />
+          </div>
+          <div class="field">
+            <label for="cfg-duty">活跃占空比先验 (0.15–1.0)</label>
+            <input id="cfg-duty" type="number" min="0.15" max="1" step="0.05" value="${cfg.dutyCyclePrior}" />
+          </div>
+          <div class="field">
+            <label for="cfg-warn">预警阈值 (剩余 %)</label>
+            <input id="cfg-warn" type="number" min="5" max="80" value="${cfg.alerts.warningRemainingPct}" />
+          </div>
+          <div class="field">
+            <label for="cfg-crit">高危阈值 (剩余 %)</label>
+            <input id="cfg-crit" type="number" min="1" max="50" value="${cfg.alerts.criticalRemainingPct}" />
+          </div>
+          <div class="field">
+            <label for="cfg-buffer">安全缓冲预留 (%)</label>
+            <input id="cfg-buffer" type="number" min="0" max="30" value="${cfg.safetyBufferPct}" />
+          </div>
+          <div class="field">
+            <label for="cfg-alerts">PostInvocation Hook 预警</label>
+            <select id="cfg-alerts">
+              <option value="true" ${cfg.alerts.enabled ? 'selected' : ''}>已开启</option>
+              <option value="false" ${!cfg.alerts.enabled ? 'selected' : ''}>已关闭</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="cfg-pro-budget">Pro/Neon 5h 加权预算</label>
+            <input id="cfg-pro-budget" type="number" min="50000" step="50000" value="${cfg.poolBudgets['gemini-pro'].shortWeightedTokens}" />
+          </div>
+          <div class="field">
+            <label for="cfg-flash-budget">Flash 5h 加权预算</label>
+            <input id="cfg-flash-budget" type="number" min="50000" step="100000" value="${cfg.poolBudgets['gemini-flash'].shortWeightedTokens}" />
+          </div>
+        </div>
+        <button type="submit" class="btn primary" ${isBusy ? 'disabled' : ''}>保存配置</button>
+      </form>
+    </div>
+  `;
+}
+
+function render(): void {
+  const root = document.getElementById('app');
+  if (!root) return;
+
+  if (!snapshot) {
+    root.innerHTML = `
+      <div class="loading-state">
+        <div class="spinner"></div>
+        <p>${escapeHtml(statusNotice || '正在等待 Antigravity Usage Monitor 数据快照...')}</p>
+      </div>
+    `;
+    return;
+  }
+
+  const pool = getSelectedPool()!;
+  const activeForecast = selectedWindow === 'short' ? pool.shortWindow : pool.weeklyWindow;
+
+  let bodyHtml = '';
+  if (activeTab === 'overview') bodyHtml = renderOverview(pool, snapshot);
+  else if (activeTab === 'trends') bodyHtml = renderTrendsTab(snapshot);
+  else if (activeTab === 'conversations') bodyHtml = renderConversationsTab(snapshot);
+  else if (activeTab === 'models') bodyHtml = renderModelsTab(snapshot);
+  else bodyHtml = renderSettingsTab(snapshot);
+
+  root.innerHTML = `
+    <header class="header">
+      <div class="header-left">
+        <span class="brand-dot ${activeForecast.status}"></span>
+        <span class="title">Antigravity Usage Monitor</span>
+        <span class="badge">${escapeHtml(snapshot.plan.toUpperCase())}</span>
+        ${statusNotice ? `<span class="toast">${escapeHtml(statusNotice)}</span>` : ''}
+      </div>
+      <div class="header-actions">
+        <button id="btn-auto" class="btn ${autoRefresh ? 'active' : ''}">自动刷新: ${autoRefresh ? '开' : '关'}</button>
+        <button id="btn-refresh" class="btn" ${isBusy ? 'disabled' : ''}>立即刷新</button>
+      </div>
+    </header>
+
+    <div class="controls-bar">
+      <div class="pill-group" role="tablist">
+        <button class="pill-btn ${activeTab === 'overview' ? 'active' : ''}" data-tab="overview">额度与预测</button>
+        <button class="pill-btn ${activeTab === 'trends' ? 'active' : ''}" data-tab="trends">24h/7d 趋势</button>
+        <button class="pill-btn ${activeTab === 'conversations' ? 'active' : ''}" data-tab="conversations">会话排行</button>
+        <button class="pill-btn ${activeTab === 'models' ? 'active' : ''}" data-tab="models">模型与工具</button>
+        <button class="pill-btn ${activeTab === 'settings' ? 'active' : ''}" data-tab="settings">配置</button>
+      </div>
+
+      ${
+        activeTab === 'overview'
+          ? `
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <div class="pill-group">
+            ${snapshot.pools
+              .map(
+                (p) =>
+                  `<button class="pill-btn ${p.poolId === pool.poolId ? 'active' : ''}" data-pool="${p.poolId}">${escapeHtml(p.displayName)}</button>`,
+              )
+              .join('')}
+          </div>
+          <div class="pill-group">
+            <button class="pill-btn ${selectedWindow === 'short' ? 'active' : ''}" data-win="short">5h 短窗</button>
+            <button class="pill-btn ${selectedWindow === 'weekly' ? 'active' : ''}" data-win="weekly">7d 周窗</button>
+          </div>
+        </div>`
+          : ''
+      }
+    </div>
+
+    ${bodyHtml}
+  `;
+
+  bindHandlers();
+}
+
+async function refreshSnapshot(): Promise<void> {
+  if (!hostConnected || isBusy) return;
+  isBusy = true;
+  render();
+  try {
+    const res = await app.callServerTool({
+      name: 'app_get_snapshot',
+      arguments: {},
+    });
+    const structured = (res as { structuredContent?: UsageSnapshot }).structuredContent;
+    if (structured) {
+      snapshot = structured;
+      statusNotice = `已更新 ${formatLocalTime(Date.now())}`;
+    }
+  } catch (err) {
+    statusNotice = `刷新失败: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    isBusy = false;
+    render();
+  }
+}
+
+async function triggerExport(format: 'markdown' | 'csv'): Promise<void> {
+  if (!hostConnected || isBusy) return;
+  isBusy = true;
+  statusNotice = `正在生成 ${format.toUpperCase()} 报告...`;
+  render();
+  try {
+    const res = await app.callServerTool({
+      name: 'app_export_report',
+      arguments: { format },
+    });
+    const sc = (res as { structuredContent?: { report?: string } }).structuredContent;
+    if (sc?.report) {
+      exportedReportText = sc.report;
+      statusNotice = `已生成 ${format.toUpperCase()} 报告`;
+    }
+  } catch (err) {
+    statusNotice = `导出失败: ${err instanceof Error ? err.message : String(err)}`;
+  } finally {
+    isBusy = false;
+    render();
+  }
+}
+
+function bindHandlers(): void {
+  document.getElementById('btn-refresh')?.addEventListener('click', () => {
+    void refreshSnapshot();
+  });
+
+  document.getElementById('btn-auto')?.addEventListener('click', () => {
+    autoRefresh = !autoRefresh;
+    render();
+  });
+
+  document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      activeTab = btn.dataset.tab as ActiveTab;
+      render();
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>('[data-pool]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      selectedPoolId = btn.dataset.pool as PoolId;
+      render();
+    });
+  });
+
+  document.querySelectorAll<HTMLButtonElement>('[data-win]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      selectedWindow = btn.dataset.win as WindowKind;
+      render();
+    });
+  });
+
+  document.getElementById('btn-export-md')?.addEventListener('click', () => {
+    void triggerExport('markdown');
+  });
+
+  document.getElementById('btn-export-csv')?.addEventListener('click', () => {
+    void triggerExport('csv');
+  });
+
+  document.getElementById('btn-copy-report')?.addEventListener('click', async () => {
+    const el = document.getElementById('report-preview') as HTMLTextAreaElement | null;
+    if (!el) return;
+    try {
+      await navigator.clipboard.writeText(el.value);
+      statusNotice = '报告已复制到剪贴板';
+      render();
+    } catch {
+      el.select();
+      statusNotice = '已选中文本，请按 Ctrl+C 复制';
+      render();
+    }
+  });
+
+  const calForm = document.getElementById('cal-form') as HTMLFormElement | null;
+  calForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!hostConnected || isBusy) return;
+    const poolId = (document.getElementById('cal-pool') as HTMLSelectElement).value as PoolId;
+    const windowKind = (document.getElementById('cal-window') as HTMLSelectElement).value as WindowKind;
+    const remainingPct = Number((document.getElementById('cal-pct') as HTMLInputElement).value);
+    const resetInMinutes = Number((document.getElementById('cal-mins') as HTMLInputElement).value);
+    isBusy = true;
+    statusNotice = '正在保存校准...';
+    render();
+    try {
+      const res = await app.callServerTool({
+        name: 'app_calibrate',
+        arguments: { poolId, windowKind, remainingPct, resetInMinutes },
+      });
+      const sc = (res as {
+        structuredContent?: { snapshot: UsageSnapshot; learnedUpdated: boolean; newTokensPerPct: number };
+      }).structuredContent;
+      if (sc?.snapshot) {
+        snapshot = sc.snapshot;
+        selectedPoolId = poolId;
+        selectedWindow = windowKind;
+        statusNotice = sc.learnedUpdated
+          ? `校准成功！已自学习新换算系数: 1% ≈ ${formatNumber(sc.newTokensPerPct)} 加权Tok`
+          : '锚点校准已保存';
+      }
+    } catch (err) {
+      statusNotice = `校准失败: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      isBusy = false;
+      render();
+    }
+  });
+
+  document.getElementById('cal-reset-btn')?.addEventListener('click', async () => {
+    if (!hostConnected || isBusy) return;
+    isBusy = true;
+    statusNotice = '正在重置校准...';
+    render();
+    try {
+      const res = await app.callServerTool({
+        name: 'app_reset_calibration',
+        arguments: { poolId: selectedPoolId, windowKind: selectedWindow },
+      });
+      const sc = (res as { structuredContent?: UsageSnapshot }).structuredContent;
+      if (sc) {
+        snapshot = sc;
+        statusNotice = '已重置当前窗口校准';
+      }
+    } catch (err) {
+      statusNotice = `重置失败: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      isBusy = false;
+      render();
+    }
+  });
+
+  const settingsForm = document.getElementById('settings-form') as HTMLFormElement | null;
+  settingsForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!hostConnected || isBusy) return;
+    const plan = (document.getElementById('cfg-plan') as HTMLSelectElement).value as PlanId;
+    const shortWindowMinutes = Number((document.getElementById('cfg-short-min') as HTMLInputElement).value);
+    const dutyCyclePrior = Number((document.getElementById('cfg-duty') as HTMLInputElement).value);
+    const warningRemainingPct = Number((document.getElementById('cfg-warn') as HTMLInputElement).value);
+    const criticalRemainingPct = Number((document.getElementById('cfg-crit') as HTMLInputElement).value);
+    const safetyBufferPct = Number((document.getElementById('cfg-buffer') as HTMLInputElement).value);
+    const alertsEnabled = (document.getElementById('cfg-alerts') as HTMLSelectElement).value === 'true';
+    const proShortBudget = Number((document.getElementById('cfg-pro-budget') as HTMLInputElement).value);
+    const flashShortBudget = Number((document.getElementById('cfg-flash-budget') as HTMLInputElement).value);
+
+    isBusy = true;
+    statusNotice = '正在保存配置...';
+    render();
+    try {
+      const payload: Record<string, unknown> = {
+        plan,
+        shortWindowMinutes,
+        dutyCyclePrior,
+        safetyBufferPct,
+        warningRemainingPct,
+        criticalRemainingPct,
+        alertsEnabled,
+      };
+      if (plan === 'custom') {
+        payload.proShortBudget = proShortBudget;
+        payload.flashShortBudget = flashShortBudget;
+      }
+      const res = await app.callServerTool({
+        name: 'app_save_config',
+        arguments: payload,
+      });
+      const sc = (res as { structuredContent?: UsageSnapshot }).structuredContent;
+      if (sc) {
+        snapshot = sc;
+        statusNotice = '配置已保存并立即生效';
+      }
+    } catch (err) {
+      statusNotice = `保存失败: ${err instanceof Error ? err.message : String(err)}`;
+    } finally {
+      isBusy = false;
+      render();
+    }
+  });
+}
+
+app.ontoolinput = () => {
+  statusNotice = '正在扫描本地 transcript.jsonl...';
+  render();
+};
+
+app.ontoolresult = (result) => {
+  const sc = (result as { structuredContent?: UsageSnapshot | { snapshot?: UsageSnapshot } }).structuredContent;
+  if (sc && 'pools' in sc) {
+    snapshot = sc;
+    selectedPoolId = sc.primaryPoolId;
+    statusNotice = '';
+    render();
+  } else if (sc && 'snapshot' in sc && sc.snapshot) {
+    snapshot = sc.snapshot;
+    selectedPoolId = sc.snapshot.primaryPoolId;
+    statusNotice = '';
+    render();
+  }
+};
+
+app.onhostcontextchanged = (ctx) => {
+  if (ctx.theme) applyDocumentTheme(ctx.theme);
+  if (ctx.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
+};
+
+setInterval(() => {
+  if (!snapshot || activeTab !== 'overview') return;
+  const pool = getSelectedPool();
+  if (!pool) return;
+  const forecast = selectedWindow === 'short' ? pool.shortWindow : pool.weeklyWindow;
+  const clockEl = document.getElementById('countdown-clock');
+  if (clockEl) {
+    clockEl.textContent = formatDurationMs(Math.max(0, forecast.nextResetAtMs - Date.now()));
+  }
+}, 1000);
+
+setInterval(() => {
+  if (autoRefresh && hostConnected && !isBusy) {
+    void refreshSnapshot();
+  }
+}, 15_000);
+
+async function bootstrap(): Promise<void> {
+  try {
+    await app.connect();
+    hostConnected = true;
+    const ctx = app.getHostContext();
+    if (ctx?.theme) applyDocumentTheme(ctx.theme);
+    if (ctx?.styles?.variables) applyHostStyleVariables(ctx.styles.variables);
+    if (!snapshot) {
+      await refreshSnapshot();
+    }
+  } catch {
+    statusNotice = '未检测到 MCP App 宿主环境（请在 Antigravity 中作为插件打开）。';
+    render();
+  }
+}
+
+void bootstrap();

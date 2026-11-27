@@ -1,0 +1,12 @@
+{
+  "usage-quota-alert": {
+    "enabled": true,
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "node ./dist/hooks/post-invocation.js",
+        "timeout": 10
+      }
+    ]
+  }
+}

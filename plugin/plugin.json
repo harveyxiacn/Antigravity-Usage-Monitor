@@ -1,0 +1,18 @@
+{
+  "name": "antigravity-usage-monitor",
+  "displayName": "Antigravity Usage Monitor",
+  "version": "1.1.0",
+  "author": {
+    "name": "harveyxiacn",
+    "url": "https://github.com/harveyxiacn"
+  },
+  "repository": "https://github.com/harveyxiacn/Antigravity-Usage-Monitor",
+  "homepage": "https://github.com/harveyxiacn/Antigravity-Usage-Monitor",
+  "description": "实时监测 Antigravity 额度消耗、预告下次刷新时余下百分比、统计累计与分会话 Tokens 及缓存命中率的本地可视化插件。",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "打开额度监控面板，查看下次刷新时预计还剩多少百分比",
+    "统计我总共用了多少 tokens、缓存命中率以及消耗最高的会话",
+    "帮我按 /usage 结果校准 Gemini Pro 池当前剩余额度和刷新倒计时"
+  ]
+}
