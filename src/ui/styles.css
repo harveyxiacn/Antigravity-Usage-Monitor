@@ -1,11 +1,11 @@
 :root {
-  --bg-primary: var(--color-background-primary, #0f1117);
-  --bg-secondary: var(--color-background-secondary, #181b24);
-  --bg-tertiary: var(--color-background-tertiary, #222634);
-  --text-primary: var(--color-text-primary, #eef1f7);
-  --text-secondary: var(--color-text-secondary, #9aa4b8);
+  --bg-primary: var(--color-background-primary, var(--background, #0f1117));
+  --bg-secondary: var(--color-background-secondary, var(--card, #181b24));
+  --bg-tertiary: var(--color-background-tertiary, var(--muted, #222634));
+  --text-primary: var(--color-text-primary, var(--foreground, #eef1f7));
+  --text-secondary: var(--color-text-secondary, var(--muted-foreground, #9aa4b8));
   --text-tertiary: var(--color-text-tertiary, #6c768a);
-  --border-primary: var(--color-border-primary, rgba(148, 163, 184, 0.2));
+  --border-primary: var(--color-border-primary, var(--border, rgba(148, 163, 184, 0.2)));
   --border-secondary: var(--color-border-secondary, rgba(148, 163, 184, 0.12));
   --accent-info: var(--color-text-info, #3b82f6);
   --accent-success: var(--color-text-success, #10b981);

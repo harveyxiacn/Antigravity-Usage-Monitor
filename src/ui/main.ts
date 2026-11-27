@@ -16,7 +16,16 @@ import type {
 
 type ActiveTab = 'overview' | 'simulate' | 'trends' | 'conversations' | 'models' | 'settings';
 
-const app = new App({ name: 'Antigravity Usage Monitor', version: '1.4.0' }, {});
+declare global {
+  interface Window {
+    __INITIAL_SNAPSHOT__?: UsageSnapshot;
+    sidecar?: {
+      fetch?: typeof fetch;
+    };
+  }
+}
+
+const app = new App({ name: 'Antigravity Usage Monitor', version: '1.4.1' }, {});
 
 let snapshot: UsageSnapshot | null = null;
 let selectedPoolId: PoolId = 'gemini-pro';
@@ -35,6 +44,13 @@ let canSendMessage = false;
 
 function isBackendReady(): boolean {
   return transportMode !== 'none';
+}
+
+function getSidecarFetch(): typeof fetch {
+  if (typeof window !== 'undefined' && window.sidecar?.fetch) {
+    return window.sidecar.fetch.bind(window.sidecar);
+  }
+  return fetch;
 }
 
 const TOOL_TO_SIDECAR_ROUTE: Record<string, { path: string; method: 'GET' | 'POST' }> = {
@@ -60,7 +76,8 @@ async function callBackend<T>(
   if (transportMode === 'sidecar') {
     const spec = TOOL_TO_SIDECAR_ROUTE[toolName];
     if (!spec) throw new Error(`Unsupported sidecar route: ${toolName}`);
-    const res = await fetch(spec.path, {
+    const fetcher = getSidecarFetch();
+    const res = await fetcher(spec.path, {
       method: spec.method,
       headers: spec.method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
       body: spec.method === 'POST' ? JSON.stringify(args) : undefined,
@@ -1273,26 +1290,49 @@ setInterval(() => {
 }, 15_000);
 
 async function bootstrap(): Promise<void> {
-  // Fast-path: Sidecar Web UI serves over http(s) on localhost with /api/snapshot
-  if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+  // 1. Instant zero-spinner render if Sidecar injected __INITIAL_SNAPSHOT__
+  if (window.__INITIAL_SNAPSHOT__ && Array.isArray(window.__INITIAL_SNAPSHOT__.pools)) {
+    transportMode = 'sidecar';
+    snapshot = window.__INITIAL_SNAPSHOT__;
+    selectedPoolId = snapshot.primaryPoolId;
+    statusNotice = '';
+    render();
+    return;
+  }
+
+  // 2. Sidecar WebView mode (served over http/https or with window.sidecar)
+  const isSidecarHost =
+    Boolean(window.sidecar) ||
+    window.location.protocol === 'http:' ||
+    window.location.protocol === 'https:';
+
+  if (isSidecarHost) {
+    transportMode = 'sidecar';
     try {
-      const res = await fetch('/api/snapshot');
-      if (res.ok) {
-        const data = (await res.json()) as UsageSnapshot;
-        if (data && Array.isArray(data.pools)) {
-          transportMode = 'sidecar';
-          snapshot = data;
-          selectedPoolId = data.primaryPoolId;
-          statusNotice = '';
-          render();
-          return;
-        }
+      const fetcher = getSidecarFetch();
+      const res = await fetcher('/api/snapshot', { method: 'GET' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as UsageSnapshot;
+      if (data && Array.isArray(data.pools)) {
+        snapshot = data;
+        selectedPoolId = data.primaryPoolId;
+        statusNotice = '';
+        render();
+        return;
       }
-    } catch {
-      // Fall through to MCP App postMessage handshake
+      throw new Error('接口返回格式异常');
+    } catch (err) {
+      // Never fall through to a hanging postMessage handshake in Sidecar mode
+      statusNotice = `Sidecar 加载失败: ${err instanceof Error ? err.message : String(err)}（正在自动重试...）`;
+      render();
+      setTimeout(() => {
+        void refreshSnapshot();
+      }, 1500);
+      return;
     }
   }
 
+  // 3. MCP App iframe mode
   try {
     await app.connect();
     transportMode = 'mcp';
