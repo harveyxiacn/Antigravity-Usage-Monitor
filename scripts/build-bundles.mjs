@@ -36,6 +36,12 @@ async function main() {
       entryPoints: [path.join(root, 'src/cli/index.ts')],
       outfile: path.join(root, 'dist/bundle/cli.mjs'),
     }),
+    build({
+      ...shared,
+      external: ['sidecar_sdk'],
+      entryPoints: [path.join(root, 'src/sidecar/main.ts')],
+      outfile: path.join(root, 'dist/bundle/sidecar.mjs'),
+    }),
   ]);
   console.log('✓ Built standalone zero-dependency bundles in dist/bundle/');
 }

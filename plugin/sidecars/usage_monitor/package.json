@@ -1,0 +1,6 @@
+{
+  "name": "usage_monitor_sidecar",
+  "version": "1.4.0",
+  "type": "module",
+  "description": "Antigravity Usage Monitor Sidecar Web UI"
+}

@@ -57,7 +57,19 @@ function main() {
   copyRecursive(path.join(projectRoot, 'dist', 'bundle'), path.join(targetDir, 'dist', 'bundle'));
   copyRecursive(path.join(projectRoot, 'dist', 'ui'), path.join(targetDir, 'dist', 'ui'));
 
-  console.log(`✅ 零依赖独立插件已安装至: ${targetDir}`);
+  // Populate sidecar folder with standalone main.mjs and index.html for right-hand Plugins -> Usage Monitor pane
+  const sidecarTargetDir = path.join(targetDir, 'sidecars', 'usage_monitor');
+  fs.mkdirSync(sidecarTargetDir, { recursive: true });
+  fs.copyFileSync(
+    path.join(projectRoot, 'dist', 'bundle', 'sidecar.mjs'),
+    path.join(sidecarTargetDir, 'main.mjs'),
+  );
+  fs.copyFileSync(
+    path.join(projectRoot, 'dist', 'ui', 'index.html'),
+    path.join(sidecarTargetDir, 'index.html'),
+  );
+
+  console.log(`✅ 零依赖独立插件（含右侧 Sidecar UI 面板）已安装至: ${targetDir}`);
   console.log('无需 node_modules，Antigravity 会自动发现并加载插件。');
 }
 

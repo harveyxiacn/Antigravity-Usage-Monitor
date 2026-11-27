@@ -1,0 +1,21 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "restart_policy": "always",
+  "display_name": "Usage Monitor",
+  "description": "实时监测 Antigravity 额度消耗、预告下次刷新时余下百分比、What-If 模拟推演与 Token 成本分析面板。",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": false
+  },
+  "ui_config": {
+    "display_name": "Usage Monitor",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Usage Monitor"
+      }
+    ]
+  }
+}

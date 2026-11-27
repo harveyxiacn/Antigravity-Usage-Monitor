@@ -16,7 +16,7 @@ import type {
 
 type ActiveTab = 'overview' | 'simulate' | 'trends' | 'conversations' | 'models' | 'settings';
 
-const app = new App({ name: 'Antigravity Usage Monitor', version: '1.3.0' }, {});
+const app = new App({ name: 'Antigravity Usage Monitor', version: '1.4.0' }, {});
 
 let snapshot: UsageSnapshot | null = null;
 let selectedPoolId: PoolId = 'gemini-pro';
@@ -30,8 +30,46 @@ let simulationResult: SimulationResult | null = null;
 let simTurns = 20;
 let simMinutes = 0;
 let simOffloadPct = 50;
-let hostConnected = false;
+let transportMode: 'none' | 'mcp' | 'sidecar' = 'none';
 let canSendMessage = false;
+
+function isBackendReady(): boolean {
+  return transportMode !== 'none';
+}
+
+const TOOL_TO_SIDECAR_ROUTE: Record<string, { path: string; method: 'GET' | 'POST' }> = {
+  app_get_snapshot: { path: '/api/snapshot', method: 'GET' },
+  app_calibrate: { path: '/api/calibrate', method: 'POST' },
+  app_reset_calibration: { path: '/api/reset-calibration', method: 'POST' },
+  app_simulate: { path: '/api/simulate', method: 'POST' },
+  app_save_config: { path: '/api/config', method: 'POST' },
+  app_export_report: { path: '/api/report', method: 'POST' },
+};
+
+async function callBackend<T>(
+  toolName: string,
+  args: Record<string, unknown> = {},
+): Promise<T | undefined> {
+  if (transportMode === 'mcp') {
+    const res = await app.callServerTool({
+      name: toolName,
+      arguments: args,
+    });
+    return (res as { structuredContent?: T }).structuredContent;
+  }
+  if (transportMode === 'sidecar') {
+    const spec = TOOL_TO_SIDECAR_ROUTE[toolName];
+    if (!spec) throw new Error(`Unsupported sidecar route: ${toolName}`);
+    const res = await fetch(spec.path, {
+      method: spec.method,
+      headers: spec.method === 'POST' ? { 'Content-Type': 'application/json' } : undefined,
+      body: spec.method === 'POST' ? JSON.stringify(args) : undefined,
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return (await res.json()) as T;
+  }
+  return undefined;
+}
 
 function formatNumber(n: number): string {
   if (!Number.isFinite(n)) return '0';
@@ -941,15 +979,11 @@ function render(): void {
 }
 
 async function refreshSnapshot(): Promise<void> {
-  if (!hostConnected || isBusy) return;
+  if (!isBackendReady() || isBusy) return;
   isBusy = true;
   render();
   try {
-    const res = await app.callServerTool({
-      name: 'app_get_snapshot',
-      arguments: {},
-    });
-    const structured = (res as { structuredContent?: UsageSnapshot }).structuredContent;
+    const structured = await callBackend<UsageSnapshot>('app_get_snapshot', {});
     if (structured) {
       snapshot = structured;
       statusNotice = `已更新 ${formatLocalTime(Date.now())}`;
@@ -963,16 +997,12 @@ async function refreshSnapshot(): Promise<void> {
 }
 
 async function triggerExport(format: 'markdown' | 'csv'): Promise<void> {
-  if (!hostConnected || isBusy) return;
+  if (!isBackendReady() || isBusy) return;
   isBusy = true;
   statusNotice = `正在生成 ${format.toUpperCase()} 报告...`;
   render();
   try {
-    const res = await app.callServerTool({
-      name: 'app_export_report',
-      arguments: { format },
-    });
-    const sc = (res as { structuredContent?: { report?: string } }).structuredContent;
+    const sc = await callBackend<{ report?: string }>('app_export_report', { format });
     if (sc?.report) {
       exportedReportText = sc.report;
       statusNotice = `已生成 ${format.toUpperCase()} 报告`;
@@ -1060,7 +1090,7 @@ function bindHandlers(): void {
   const simForm = document.getElementById('sim-form') as HTMLFormElement | null;
   simForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (!hostConnected || isBusy) return;
+    if (!isBackendReady() || isBusy) return;
     const poolId = (document.getElementById('sim-pool') as HTMLSelectElement).value as PoolId;
     simTurns = Number((document.getElementById('sim-turns') as HTMLInputElement).value);
     simMinutes = Number((document.getElementById('sim-mins') as HTMLInputElement).value);
@@ -1070,17 +1100,13 @@ function bindHandlers(): void {
     statusNotice = '正在运行 What-If 推演...';
     render();
     try {
-      const res = await app.callServerTool({
-        name: 'app_simulate',
-        arguments: {
-          poolId,
-          windowKind: selectedWindow,
-          additionalTurns: simTurns,
-          additionalMinutes: simMinutes,
-          offloadToFlashPct: simOffloadPct,
-        },
+      const sc = await callBackend<SimulationResult>('app_simulate', {
+        poolId,
+        windowKind: selectedWindow,
+        additionalTurns: simTurns,
+        additionalMinutes: simMinutes,
+        offloadToFlashPct: simOffloadPct,
       });
-      const sc = (res as { structuredContent?: SimulationResult }).structuredContent;
       if (sc) {
         simulationResult = sc;
         statusNotice = '推演完成';
@@ -1096,7 +1122,7 @@ function bindHandlers(): void {
   const calForm = document.getElementById('cal-form') as HTMLFormElement | null;
   calForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (!hostConnected || isBusy) return;
+    if (!isBackendReady() || isBusy) return;
     const poolId = (document.getElementById('cal-pool') as HTMLSelectElement).value as PoolId;
     const windowKind = (document.getElementById('cal-window') as HTMLSelectElement).value as WindowKind;
     const remainingPct = Number((document.getElementById('cal-pct') as HTMLInputElement).value);
@@ -1105,18 +1131,12 @@ function bindHandlers(): void {
     statusNotice = '正在保存校准...';
     render();
     try {
-      const res = await app.callServerTool({
-        name: 'app_calibrate',
-        arguments: { poolId, windowKind, remainingPct, resetInMinutes },
-      });
-      const sc = (res as {
-        structuredContent?: {
-          snapshot: UsageSnapshot;
-          learnedUpdated: boolean;
-          newTokensPerPct: number;
-          absoluteErrorPct: number;
-        };
-      }).structuredContent;
+      const sc = await callBackend<{
+        snapshot: UsageSnapshot;
+        learnedUpdated: boolean;
+        newTokensPerPct: number;
+        absoluteErrorPct: number;
+      }>('app_calibrate', { poolId, windowKind, remainingPct, resetInMinutes });
       if (sc?.snapshot) {
         snapshot = sc.snapshot;
         selectedPoolId = poolId;
@@ -1134,16 +1154,15 @@ function bindHandlers(): void {
   });
 
   document.getElementById('cal-reset-btn')?.addEventListener('click', async () => {
-    if (!hostConnected || isBusy) return;
+    if (!isBackendReady() || isBusy) return;
     isBusy = true;
     statusNotice = '正在重置校准...';
     render();
     try {
-      const res = await app.callServerTool({
-        name: 'app_reset_calibration',
-        arguments: { poolId: selectedPoolId, windowKind: selectedWindow },
+      const sc = await callBackend<UsageSnapshot>('app_reset_calibration', {
+        poolId: selectedPoolId,
+        windowKind: selectedWindow,
       });
-      const sc = (res as { structuredContent?: UsageSnapshot }).structuredContent;
       if (sc) {
         snapshot = sc;
         statusNotice = '已重置当前窗口校准';
@@ -1159,7 +1178,7 @@ function bindHandlers(): void {
   const settingsForm = document.getElementById('settings-form') as HTMLFormElement | null;
   settingsForm?.addEventListener('submit', async (e) => {
     e.preventDefault();
-    if (!hostConnected || isBusy) return;
+    if (!isBackendReady() || isBusy) return;
     const plan = (document.getElementById('cfg-plan') as HTMLSelectElement).value as PlanId;
     const shortWindowMinutes = Number((document.getElementById('cfg-short-min') as HTMLInputElement).value);
     const dutyCyclePrior = Number((document.getElementById('cfg-duty') as HTMLInputElement).value);
@@ -1189,11 +1208,7 @@ function bindHandlers(): void {
         payload.proShortBudget = proShortBudget;
         payload.flashShortBudget = flashShortBudget;
       }
-      const res = await app.callServerTool({
-        name: 'app_save_config',
-        arguments: payload,
-      });
-      const sc = (res as { structuredContent?: UsageSnapshot }).structuredContent;
+      const sc = await callBackend<UsageSnapshot>('app_save_config', payload);
       if (sc) {
         snapshot = sc;
         statusNotice = '配置已保存并立即生效';
@@ -1245,22 +1260,42 @@ setInterval(() => {
     clockEl.textContent = formatDurationMs(Math.max(0, remaining));
   }
   // Automatically reload snapshot once when refresh countdown crosses 00:00:00
-  if (remaining <= 0 && forecast.nextResetAtMs !== lastRolledOverResetAt && hostConnected && !isBusy) {
+  if (remaining <= 0 && forecast.nextResetAtMs !== lastRolledOverResetAt && isBackendReady() && !isBusy) {
     lastRolledOverResetAt = forecast.nextResetAtMs;
     void refreshSnapshot();
   }
 }, 1000);
 
 setInterval(() => {
-  if (autoRefresh && hostConnected && !isBusy) {
+  if (autoRefresh && isBackendReady() && !isBusy) {
     void refreshSnapshot();
   }
 }, 15_000);
 
 async function bootstrap(): Promise<void> {
+  // Fast-path: Sidecar Web UI serves over http(s) on localhost with /api/snapshot
+  if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+    try {
+      const res = await fetch('/api/snapshot');
+      if (res.ok) {
+        const data = (await res.json()) as UsageSnapshot;
+        if (data && Array.isArray(data.pools)) {
+          transportMode = 'sidecar';
+          snapshot = data;
+          selectedPoolId = data.primaryPoolId;
+          statusNotice = '';
+          render();
+          return;
+        }
+      }
+    } catch {
+      // Fall through to MCP App postMessage handshake
+    }
+  }
+
   try {
     await app.connect();
-    hostConnected = true;
+    transportMode = 'mcp';
     const caps = app.getHostCapabilities();
     canSendMessage = Boolean(caps && (caps as Record<string, unknown>).message);
     const ctx = app.getHostContext();
@@ -1270,7 +1305,7 @@ async function bootstrap(): Promise<void> {
       await refreshSnapshot();
     }
   } catch {
-    statusNotice = '未检测到 MCP App 宿主环境（请在 Antigravity 中作为插件打开）。';
+    statusNotice = '未检测到 Antigravity 宿主环境（请在 Antigravity 插件或 Sidecar 中打开）。';
     render();
   }
 }
